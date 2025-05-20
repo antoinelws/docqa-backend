@@ -108,12 +108,9 @@ def sync_sharepoint():
 
             index = faiss.IndexFlatL2(VECTOR_DIM)
             index.add(np.array(vectors).astype("float32"))
-            faiss.write_index(index, Path(DESTINATION_FOLDER) / f"{base_name}.index")
+            faiss.write_index(index, str(Path(DESTINATION_FOLDER) / f"{base_name}.index"))
 
     print("✅ Sync complete. Files processed and saved to ./documents/")
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
