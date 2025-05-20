@@ -49,14 +49,15 @@ def sync_sharepoint():
     print(site_list_resp.status_code)
     print(site_list_resp.text)
 
+# === Use site ID directly ===
 site_id = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
 
+# === Get Folder Items ===
+drive_resp = requests.get(
+    f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
+    headers=headers
+)
 
-    # === Get Folder Items ===
-    drive_resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
-        headers=headers
-    )
     drive_resp.raise_for_status()
     files = drive_resp.json().get("value", [])
 
