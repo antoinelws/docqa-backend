@@ -57,20 +57,20 @@ drive_resp = requests.get(
     f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
     headers=headers
 )
+drive_resp.raise_for_status()
+files = drive_resp.json().get("value", [])
 
-    drive_resp.raise_for_status()
-    files = drive_resp.json().get("value", [])
+# === Download Supported Files ===
+for file in files:
+    name = file.get("name")
+    if name.endswith(".pdf") or name.endswith(".docx"):
+        print(f"Downloading: {name}")
+        download_url = file.get("@microsoft.graph.downloadUrl")
+        file_data = requests.get(download_url)
+        dest_path = Path(DESTINATION_FOLDER) / name
+        with open(dest_path, "wb") as f:
+            f.write(file_data.content)
 
-    # === Download Supported Files ===
-    for file in files:
-        name = file.get("name")
-        if name.endswith(".pdf") or name.endswith(".docx"):
-            print(f"Downloading: {name}")
-            download_url = file.get("@microsoft.graph.downloadUrl")
-            file_data = requests.get(download_url)
-            dest_path = Path(DESTINATION_FOLDER) / name
-            with open(dest_path, "wb") as f:
-                f.write(file_data.content)
 
     print("✅ Sync complete. Files saved to ./documents/")
 
