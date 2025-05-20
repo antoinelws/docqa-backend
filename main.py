@@ -17,8 +17,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Paste your OpenAI API key here
-openai.api_key = "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"
+import os
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Constants
 EMBEDDING_MODEL = "text-embedding-3-large"
