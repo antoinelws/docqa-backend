@@ -39,40 +39,30 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # === TEMP DEBUG: List available SharePoint sites ===
-    print("📡 Querying available sites to locate correct 'PMO' site...")
-    site_list_resp = requests.get(
-        "https://graph.microsoft.com/v1.0/sites?search=PMO",
+    # === Use site ID directly (from PMO site debug) ===
+    site_id = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
+
+    # === Get Folder Items ===
+    drive_resp = requests.get(
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
         headers=headers
     )
-    print("🔎 Site search response:")
-    print(site_list_resp.status_code)
-    print(site_list_resp.text)
+    drive_resp.raise_for_status()
+    files = drive_resp.json().get("value", [])
 
-# === Use site ID directly ===
-site_id = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
-
-# === Get Folder Items ===
-drive_resp = requests.get(
-    f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
-    headers=headers
-)
-drive_resp.raise_for_status()
-files = drive_resp.json().get("value", [])
-
-# === Download Supported Files ===
-for file in files:
-    name = file.get("name")
-    if name.endswith(".pdf") or name.endswith(".docx"):
-        print(f"Downloading: {name}")
-        download_url = file.get("@microsoft.graph.downloadUrl")
-        file_data = requests.get(download_url)
-        dest_path = Path(DESTINATION_FOLDER) / name
-        with open(dest_path, "wb") as f:
-            f.write(file_data.content)
-
+    # === Download Supported Files ===
+    for file in files:
+        name = file.get("name")
+        if name.endswith(".pdf") or name.endswith(".docx"):
+            print(f"Downloading: {name}")
+            download_url = file.get("@microsoft.graph.downloadUrl")
+            file_data = requests.get(download_url)
+            dest_path = Path(DESTINATION_FOLDER) / name
+            with open(dest_path, "wb") as f:
+                f.write(file_data.content)
 
     print("✅ Sync complete. Files saved to ./documents/")
+
 
 # Auto-run on backend startup
 try:
