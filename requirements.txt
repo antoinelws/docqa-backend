@@ -5,3 +5,4 @@ pdfplumber
 python-docx
 python-multipart
 faiss-cpu
+msal
