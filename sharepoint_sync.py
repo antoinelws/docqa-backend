@@ -39,7 +39,9 @@ def sync_sharepoint():
 
     # === Access specific folder using fully encoded path ===
     encoded_path = FOLDER_PATH.replace(" ", "%20")
-    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/{encoded_path}:/children"
+    DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
+    encoded_path = FOLDER_PATH.replace(" ", "%20")
+    url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{encoded_path}:/children"
     drive_resp = requests.get(url, headers=headers)
     drive_resp.raise_for_status()
     files = drive_resp.json().get("value", [])
