@@ -12,7 +12,7 @@ CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 
 # === SharePoint Info ===
 SHAREPOINT_SITE_ID = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
-DOCUMENT_LIBRARY = "Documents"  # Try "Shared Documents" if this fails
+DOCUMENT_LIBRARY = "Shared Documents"
 FOLDER_PATH = "AI"
 
 # === Backend processing path ===
@@ -38,40 +38,30 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # === TEMP: Debug root contents ===
-    print("📂 Debug: Listing root folder of site to verify document library...")
+    # === Access specific folder ===
     drive_resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root/children",
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
         headers=headers
     )
-    print("📦 Drive root contents:")
-    print(drive_resp.status_code)
-    print(drive_resp.text)
+    drive_resp.raise_for_status()
+    files = drive_resp.json().get("value", [])
 
-    # === Try to access specific folder (commented out for now) ===
-    # drive_resp = requests.get(
-    #     f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
-    #     headers=headers
-    # )
-    # drive_resp.raise_for_status()
-    # files = drive_resp.json().get("value", [])
+    # === Download Supported Files ===
+    for file in files:
+        name = file.get("name")
+        if name.endswith(".pdf") or name.endswith(".docx"):
+            print(f"Downloading: {name}")
+            download_url = file.get("@microsoft.graph.downloadUrl")
+            file_data = requests.get(download_url)
+            dest_path = Path(DESTINATION_FOLDER) / name
+            with open(dest_path, "wb") as f:
+                f.write(file_data.content)
 
-    # # === Download Supported Files ===
-    # for file in files:
-    #     name = file.get("name")
-    #     if name.endswith(".pdf") or name.endswith(".docx"):
-    #         print(f"Downloading: {name}")
-    #         download_url = file.get("@microsoft.graph.downloadUrl")
-    #         file_data = requests.get(download_url)
-    #         dest_path = Path(DESTINATION_FOLDER) / name
-    #         with open(dest_path, "wb") as f:
-    #             f.write(file_data.content)
-
-    print("✅ Folder listing complete. Check output above.")
+    print("✅ Sync complete. Files saved to ./documents/")
 
 # Auto-run on backend startup
 try:
     print("🚀 Running SharePoint sync...")
     sync_sharepoint()
 except Exception as e:
-    print(f"❌ SharePoint sync failed: {e}")
+    print(f"❌ ShareP
