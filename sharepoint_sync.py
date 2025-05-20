@@ -11,8 +11,8 @@ TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 
 # === SharePoint Info ===
-SHAREPOINT_SITE_ID = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
-FOLDER_PATH = "Shared Documents/AI"
+DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
+FOLDER_PATH = "AI"
 
 # === Backend processing path ===
 DESTINATION_FOLDER = "documents"
@@ -37,9 +37,7 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # === Access specific folder using fully encoded path ===
-    encoded_path = FOLDER_PATH.replace(" ", "%20")
-    DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
+    # === Access specific folder using drive ID and encoded path ===
     encoded_path = FOLDER_PATH.replace(" ", "%20")
     url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{encoded_path}:/children"
     drive_resp = requests.get(url, headers=headers)
