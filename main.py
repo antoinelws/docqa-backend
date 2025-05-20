@@ -5,8 +5,16 @@ import pdfplumber, docx, os, json
 import openai
 import faiss
 import numpy as np
+from sharepoint_sync import sync_sharepoint
 
 app = FastAPI()
+
+try:
+    print("🚀 Running SharePoint sync on startup...")
+    sync_sharepoint()
+except Exception as e:
+    print(f"❌ SharePoint sync failed: {e}")
+
 
 # Allow frontend/mobile app access
 app.add_middleware(
