@@ -68,6 +68,9 @@ def sync_sharepoint():
 
     print("✅ Sync complete. Files saved to ./documents/")
 
-# Auto-run on server startup
-if __name__ == "__main__":
+# Auto-run on backend startup
+try:
+    print("🚀 Running SharePoint sync...")
     sync_sharepoint()
+except Exception as e:
+    print(f"❌ SharePoint sync failed: {e}")
