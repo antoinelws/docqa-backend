@@ -12,7 +12,7 @@ CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 
 # === SharePoint Info ===
 SHAREPOINT_SITE = "erpintegratedsolutions.sharepoint.com"
-SHAREPOINT_SITE_NAME = "PMO Folder"
+SHAREPOINT_SITE_NAME = "PMO"
 DOCUMENT_LIBRARY = "Documents"
 FOLDER_PATH = "AI"
 
