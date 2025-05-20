@@ -64,4 +64,4 @@ try:
     print("🚀 Running SharePoint sync...")
     sync_sharepoint()
 except Exception as e:
-    print(f"❌ ShareP
+    print(f"❌ SharePoint sync failed: {e}")
