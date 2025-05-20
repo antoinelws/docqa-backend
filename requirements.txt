@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+openai==0.28
+pdfplumber
+python-docx
+python-multipart
+faiss-cpu
