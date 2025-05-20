@@ -12,8 +12,7 @@ CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 
 # === SharePoint Info ===
 SHAREPOINT_SITE_ID = "erpintegratedsolutions.sharepoint.com,c1cacbae-8c33-4735-8246-3b110cc661fa,18806b4a-b5b7-4bcd-8965-4a6e23ab9ad5"
-DOCUMENT_LIBRARY = "Shared Documents"
-FOLDER_PATH = "AI"
+FOLDER_PATH = "Shared Documents/AI"
 
 # === Backend processing path ===
 DESTINATION_FOLDER = "documents"
@@ -38,11 +37,10 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # === Access specific folder ===
-    drive_resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/Shared%20Documents/AI:/children",
-        headers=headers
-    )
+    # === Access specific folder using fully encoded path ===
+    encoded_path = FOLDER_PATH.replace(" ", "%20")
+    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/{encoded_path}:/children"
+    drive_resp = requests.get(url, headers=headers)
     drive_resp.raise_for_status()
     files = drive_resp.json().get("value", [])
 
