@@ -12,7 +12,7 @@ CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 
 # === SharePoint Info ===
 SHAREPOINT_SITE = "erpintegratedsolutions.sharepoint.com"
-SHAREPOINT_SITE_NAME = "PMO"
+SHAREPOINT_SITE_NAME = "PMO Folder"  # This may be incorrect and will be discovered via debug
 DOCUMENT_LIBRARY = "Documents"
 FOLDER_PATH = "AI"
 
@@ -39,7 +39,17 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # === Resolve Site ID ===
+    # === TEMP DEBUG: List available SharePoint sites ===
+    print("📡 Querying available sites to locate correct 'PMO' site...")
+    site_list_resp = requests.get(
+        "https://graph.microsoft.com/v1.0/sites?search=PMO",
+        headers=headers
+    )
+    print("🔎 Site search response:")
+    print(site_list_resp.status_code)
+    print(site_list_resp.text)
+
+    # === ORIGINAL: Try to resolve site ID using current input ===
     site_resp = requests.get(
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE}:/sites/{SHAREPOINT_SITE_NAME}",
         headers=headers
