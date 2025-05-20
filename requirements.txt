@@ -6,3 +6,6 @@ python-docx
 python-multipart
 faiss-cpu
 msal
+python-dotenv
+requests
+numpy
