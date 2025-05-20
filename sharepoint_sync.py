@@ -40,7 +40,7 @@ def sync_sharepoint():
 
     # === Access specific folder ===
     drive_resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/{DOCUMENT_LIBRARY}/{FOLDER_PATH}:/children",
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drive/root:/Shared%20Documents/AI:/children",
         headers=headers
     )
     drive_resp.raise_for_status()
