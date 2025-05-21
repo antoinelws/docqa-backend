@@ -88,27 +88,33 @@ def sync_sharepoint():
 
     for file in files:
         name = file.get("name")
+        base_name = os.path.splitext(name)[0]
+        json_path = Path(DESTINATION_FOLDER) / f"{base_name}.json"
+        index_path = Path(DESTINATION_FOLDER) / f"{base_name}.index"
+
+        if json_path.exists() and index_path.exists():
+            print(f"⏭️ Skipping already processed file: {name}")
+            continue
+
         if name.endswith(".pdf") or name.endswith(".docx"):
-            print(f"Downloading: {name}")
+            print(f"📥 Downloading: {name}")
             download_url = file.get("@microsoft.graph.downloadUrl")
             file_data = requests.get(download_url)
             dest_path = Path(DESTINATION_FOLDER) / name
             with open(dest_path, "wb") as f:
                 f.write(file_data.content)
 
-            # === Process file for embeddings ===
             content = file_data.content
             text = extract_text(name, content)
             chunks = chunk_text(text)
             vectors = embed_texts(chunks)
 
-            base_name = os.path.splitext(name)[0]
-            with open(Path(DESTINATION_FOLDER) / f"{base_name}.json", "w", encoding="utf-8") as f:
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(chunks, f)
 
             index = faiss.IndexFlatL2(VECTOR_DIM)
             index.add(np.array(vectors).astype("float32"))
-            faiss.write_index(index, str(Path(DESTINATION_FOLDER) / f"{base_name}.index"))
+            faiss.write_index(index, str(index_path))
 
     print("✅ Sync complete. Files processed and saved to ./documents/")
 
