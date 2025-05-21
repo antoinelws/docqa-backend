@@ -5,9 +5,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pdfplumber, docx, json
 import faiss
 import numpy as np
+import datetime
 
 # === Load secrets from environment ===
 load_dotenv()
@@ -23,6 +25,8 @@ FOLDER_PATH = "AI"
 # === Backend processing path ===
 DESTINATION_FOLDER = "documents"
 os.makedirs(DESTINATION_FOLDER, exist_ok=True)
+
+HISTORY_LOG = os.path.join(DESTINATION_FOLDER, "sync_log.csv")
 
 # === Constants for embedding ===
 EMBEDDING_MODEL = "text-embedding-3-large"
@@ -77,6 +81,27 @@ def embed_texts(texts):
     response = openai.Embedding.create(input=texts, model=EMBEDDING_MODEL)
     return [d["embedding"] for d in response["data"]]
 
+def log_sync_activity(filename, user_name, user_email):
+    timestamp = datetime.datetime.utcnow().isoformat()
+    with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp},{filename},{user_name},{user_email}\n")
+
+def get_last_log_entry():
+    if not os.path.exists(HISTORY_LOG):
+        return None
+    with open(HISTORY_LOG, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        if not lines:
+            return None
+        last_line = lines[-1].strip()
+        timestamp, filename, user_name, user_email = last_line.split(",")
+        return {
+            "timestamp": timestamp,
+            "filename": filename,
+            "user_name": user_name,
+            "user_email": user_email
+        }
+
 def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -88,6 +113,11 @@ def sync_sharepoint():
 
     for file in files:
         name = file.get("name")
+        ext = name.lower().split(".")[-1]
+        if ext not in ["pdf", "docx"]:
+            print(f"🚫 Skipping unsupported file: {name}")
+            continue
+
         base_name = os.path.splitext(name)[0]
         json_path = Path(DESTINATION_FOLDER) / f"{base_name}.json"
         index_path = Path(DESTINATION_FOLDER) / f"{base_name}.index"
@@ -96,25 +126,29 @@ def sync_sharepoint():
             print(f"⏭️ Skipping already processed file: {name}")
             continue
 
-        if name.endswith(".pdf") or name.endswith(".docx"):
-            print(f"📥 Downloading: {name}")
-            download_url = file.get("@microsoft.graph.downloadUrl")
-            file_data = requests.get(download_url)
-            dest_path = Path(DESTINATION_FOLDER) / name
-            with open(dest_path, "wb") as f:
-                f.write(file_data.content)
+        print(f"📥 Downloading: {name}")
+        download_url = file.get("@microsoft.graph.downloadUrl")
+        file_data = requests.get(download_url)
+        dest_path = Path(DESTINATION_FOLDER) / name
+        with open(dest_path, "wb") as f:
+            f.write(file_data.content)
 
-            content = file_data.content
-            text = extract_text(name, content)
-            chunks = chunk_text(text)
-            vectors = embed_texts(chunks)
+        content = file_data.content
+        text = extract_text(name, content)
+        chunks = chunk_text(text)
+        vectors = embed_texts(chunks)
 
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(chunks, f)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(chunks, f)
 
-            index = faiss.IndexFlatL2(VECTOR_DIM)
-            index.add(np.array(vectors).astype("float32"))
-            faiss.write_index(index, str(index_path))
+        index = faiss.IndexFlatL2(VECTOR_DIM)
+        index.add(np.array(vectors).astype("float32"))
+        faiss.write_index(index, str(index_path))
+
+        user_info = file.get("createdBy", {}).get("user", {})
+        user_name = user_info.get("displayName", "Unknown")
+        user_email = user_info.get("email", "Unknown")
+        log_sync_activity(name, user_name, user_email)
 
     print("✅ Sync complete. Files processed and saved to ./documents/")
 
@@ -136,8 +170,15 @@ def trigger_sync():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-#try:
-#    print("🚀 Running SharePoint sync on startup...")
-#    sync_sharepoint()
-#except Exception as e:
-#    print(f"❌ SharePoint sync failed: {e}")
+@app.get("/sync-latest")
+def get_sync_latest():
+    latest = get_last_log_entry()
+    if not latest:
+        return JSONResponse(status_code=404, content={"error": "No sync history found."})
+    return latest
+
+try:
+    print("🚀 Running SharePoint sync on startup...")
+    sync_sharepoint()
+except Exception as e:
+    print(f"❌ SharePoint sync failed: {e}")
