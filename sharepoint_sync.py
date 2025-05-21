@@ -136,8 +136,8 @@ def trigger_sync():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-try:
-    print("🚀 Running SharePoint sync on startup...")
-    sync_sharepoint()
-except Exception as e:
-    print(f"❌ SharePoint sync failed: {e}")
+#try:
+#    print("🚀 Running SharePoint sync on startup...")
+#    sync_sharepoint()
+#except Exception as e:
+#    print(f"❌ SharePoint sync failed: {e}")
