@@ -181,6 +181,10 @@ if os.path.exists(INTERNAL_USER_FILE):
 else:
     INTERNAL_USERS = {}
 
+# Admin panel setup for managing internal users
+from fastapi import Request, Form
+from fastapi.responses import HTMLResponse
+
 app = FastAPI()
 
 app.add_middleware(
@@ -267,6 +271,39 @@ Answer:"
         return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard():
+    users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
+    return f"""
+        <h2>Internal Users</h2>
+        <p>{users or 'No users added yet.'}</p>
+        <form method='post' action='/admin/add'>
+            <input name='email' placeholder='Add user email' required>
+            <button type='submit'>Add User</button>
+        </form>
+        <form method='post' action='/admin/remove'>
+            <input name='email' placeholder='Remove user email' required>
+            <button type='submit'>Remove User</button>
+        </form>
+    """
+
+@app.post("/admin/add")
+def add_internal_user(email: str = Form(...)):
+    INTERNAL_USERS[email] = True
+    with open(INTERNAL_USER_FILE, "w") as f:
+        json.dump(INTERNAL_USERS, f, indent=2)
+    return HTMLResponse(f"<p>{email} added as internal user. <a href='/admin'>Back</a></p>")
+
+@app.post("/admin/remove")
+def remove_internal_user(email: str = Form(...)):
+    if email in INTERNAL_USERS:
+        del INTERNAL_USERS[email]
+        with open(INTERNAL_USER_FILE, "w") as f:
+            json.dump(INTERNAL_USERS, f, indent=2)
+        return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
+    return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
 
 @app.get("/sync-latest")
