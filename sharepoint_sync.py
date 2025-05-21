@@ -244,23 +244,12 @@ def ask_question(question: str, user_email: str):
         if not top_chunks:
             return {"answer": "No relevant content found."}
 
-        prompt = (
-            "You are an AI assistant. Use the following document excerpts to answer the question.
+prompt = (
+    "You are an AI assistant. Use the following document excerpts to answer the question.\n\n"
+    + "\n\n".join(top_chunks)
+    + f"\n\nQuestion: {question}\nAnswer:"
+)
 
-"
-            + "
-
-".join(top_chunks)
-            + f"
-
-Question: {question}
-Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
 
         import openai
         openai.api_key = OPENAI_API_KEY
