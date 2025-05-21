@@ -103,6 +103,22 @@ def get_last_log_entry():
         }
 
 def sync_sharepoint():
+    internal_subfolder = "Internal"
+    public_subfolder = "Public"
+
+    def list_files(sub_path):
+        full_path = f"{FOLDER_PATH}/{sub_path}".replace(" ", "%20")
+        url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{full_path}:/children"
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("value", []), sub_path
+
+    access_token = authenticate()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    internal_files, internal_label = list_files(internal_subfolder)
+    public_files, public_label = list_files(public_subfolder)
+    all_files = [(f, "internal") for f in internal_files] + [(f, "public") for f in public_files]
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
     encoded_path = FOLDER_PATH.replace(" ", "%20")
@@ -111,7 +127,7 @@ def sync_sharepoint():
     drive_resp.raise_for_status()
     files = drive_resp.json().get("value", [])
 
-    for file in files:
+    for file, access_level in all_files:
         name = file.get("name")
         ext = name.lower().split(".")[-1]
         if ext not in ["pdf", "docx"]:
@@ -119,8 +135,10 @@ def sync_sharepoint():
             continue
 
         base_name = os.path.splitext(name)[0]
-        json_path = Path(DESTINATION_FOLDER) / f"{base_name}.json"
-        index_path = Path(DESTINATION_FOLDER) / f"{base_name}.index"
+        subfolder = Path(DESTINATION_FOLDER) / access_level
+        subfolder.mkdir(parents=True, exist_ok=True)
+        json_path = subfolder / f"{base_name}.json"
+        index_path = subfolder / f"{base_name}.index"
 
         if json_path.exists() and index_path.exists():
             print(f"⏭️ Skipping already processed file: {name}")
@@ -130,7 +148,7 @@ def sync_sharepoint():
         print(f"📥 Downloading: {name}")
         download_url = file.get("@microsoft.graph.downloadUrl")
         file_data = requests.get(download_url)
-        dest_path = Path(DESTINATION_FOLDER) / name
+        dest_path = subfolder / name
         with open(dest_path, "wb") as f:
             f.write(file_data.content)
 
