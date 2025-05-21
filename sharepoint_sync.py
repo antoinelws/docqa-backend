@@ -256,6 +256,11 @@ def ask_question(question: str, user_email: str):
 Question: {question}
 Answer:"
         )
+            + f"
+
+Question: {question}
+Answer:"
+        )
 
         import openai
         openai.api_key = OPENAI_API_KEY
