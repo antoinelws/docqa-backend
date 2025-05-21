@@ -276,6 +276,11 @@ Answer:"
 Question: {question}
 Answer:"
         )
+            + f"
+
+Question: {question}
+Answer:"
+        )
 
         import openai
         openai.api_key = OPENAI_API_KEY
