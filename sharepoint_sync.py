@@ -255,34 +255,7 @@ def ask_question(question: str, user_email: str):
 
 Question: {question}
 Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
-            + f"
-
-Question: {question}
-Answer:"
-        )
-
-        import openai
+        )import openai
         openai.api_key = OPENAI_API_KEY
         response = openai.ChatCompletion.create(
             model="gpt-4",
