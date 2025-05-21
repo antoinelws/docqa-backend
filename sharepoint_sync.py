@@ -244,7 +244,13 @@ def ask_question(question: str, user_email: str):
         if not top_chunks:
             return {"answer": "No relevant content found."}
 
-        prompt = "Answer the question based on the documents."
+        prompt = (
+            "You are an AI assistant. Use the following document excerpts to answer the question.
+
+"
+            + "
+
+".join(top_chunks)
             + f"
 
 Question: {question}
