@@ -245,7 +245,6 @@ def ask_question(question: str, user_email: str):
             return {"answer": "No relevant content found."}
 
         prompt = "You are an AI assistant. Use the available document content to answer the user's question as accurately as possible."
-            + f"
 
 Question: {question}
 Answer:"
