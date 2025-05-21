@@ -126,6 +126,7 @@ def sync_sharepoint():
             print(f"⏭️ Skipping already processed file: {name}")
             continue
 
+        # Only download if not already processed
         print(f"📥 Downloading: {name}")
         download_url = file.get("@microsoft.graph.downloadUrl")
         file_data = requests.get(download_url)
