@@ -171,6 +171,16 @@ def sync_sharepoint():
 
     print("✅ Sync complete. Files processed and saved to ./documents/")
 
+import glob
+
+# Load internal user list
+INTERNAL_USER_FILE = "internal_users.json"
+if os.path.exists(INTERNAL_USER_FILE):
+    with open(INTERNAL_USER_FILE, "r") as f:
+        INTERNAL_USERS = json.load(f)
+else:
+    INTERNAL_USERS = {}
+
 app = FastAPI()
 
 app.add_middleware(
@@ -188,6 +198,76 @@ def trigger_sync():
         return {"status": "success", "message": "SharePoint sync completed."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.post("/ask")
+def ask_question(question: str, user_email: str):
+    try:
+        from fastapi import Form
+        from typing import List
+
+        def load_chunks_and_index(folder):
+            results = []
+            paths = glob.glob(f"{folder}/*.json")
+            for json_path in paths:
+                base = os.path.splitext(os.path.basename(json_path))[0]
+                index_path = os.path.join(folder, f"{base}.index")
+                if not os.path.exists(index_path):
+                    continue
+                with open(json_path, "r", encoding="utf-8") as f:
+                    chunks = json.load(f)
+                index = faiss.read_index(index_path)
+                results.append((chunks, index))
+            return results
+
+        access_folders = ["documents/public"]
+        if INTERNAL_USERS.get(user_email):
+            access_folders.append("documents/internal")
+
+        question_vec = embed_texts([question])[0]
+        combined_chunks = []
+
+        for folder in access_folders:
+            data = load_chunks_and_index(folder)
+            for chunks, index in data:
+                D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
+                for score, idx in zip(D[0], I[0]):
+                    if 0 <= idx < len(chunks):
+                        combined_chunks.append((score, chunks[idx]))
+
+        combined_chunks.sort(key=lambda x: x[0])
+        top_chunks = [chunk for _, chunk in combined_chunks[:5]]
+
+        if not top_chunks:
+            return {"answer": "No relevant content found."}
+
+        prompt = (
+            "You are an AI assistant. Use the following document excerpts to answer the question.
+
+"
+            + "
+
+".join(top_chunks)
+            + f"
+
+Question: {question}
+Answer:"
+        )
+
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You answer questions based on documents."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+
+        return {"answer": response.choices[0].message.content}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/sync-latest")
 def get_sync_latest():
