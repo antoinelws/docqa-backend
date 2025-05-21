@@ -243,11 +243,12 @@ def ask_question(question: str, user_email: str):
 
         if not top_chunks:
             return {"answer": "No relevant content found."}
+        
+        prompt = f"""You are an AI assistant. Answer the question below based on the document contents.
 
-        prompt = f"You are an AI assistant. Answer the question below based on the document contents.
-
-Question: {question}
-Answer:""
+        Question: {question}
+        Answer:"""
+       
         import openai
         openai.api_key = OPENAI_API_KEY
         response = openai.ChatCompletion.create(
