@@ -329,6 +329,18 @@ def get_sync_latest():
         return JSONResponse(status_code=404, content={"error": "No sync history found."})
     return latest
 
+@app.post("/ask-from-slack")
+async def ask_from_slack(request: Request):
+    form = await request.form()
+    question = form.get("text")
+    user_email = form.get("user_email") or "default@shiperp.com"  # fallback
+    try:
+        answer = ask_question(question=question, user_email=user_email)
+        return {"response_type": "in_channel", "text": answer["answer"]}
+    except Exception as e:
+        return {"response_type": "ephemeral", "text": f"Error: {str(e)}"}
+
+
 try:
     print("🚀 Running SharePoint sync on startup...")
     sync_sharepoint()
