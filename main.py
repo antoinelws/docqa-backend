@@ -260,6 +260,7 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
 
         if not top_chunks:
             return {"answer": "No relevant content found."}
+        print("Top Chunks:", top_chunks)
 
         prompt = f"""You are an AI assistant. Answer the question below based on the document contents.
 
