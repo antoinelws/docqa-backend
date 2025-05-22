@@ -262,10 +262,18 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
             return {"answer": "No relevant content found."}
         print("Top Chunks:", top_chunks)
 
-        prompt = f"""You are an AI assistant. Answer the question below based on the document contents.
+        prompt = f"""You are a helpful assistant answering questions using company documentation.
+
+Based on the content provided below, answer the user's question clearly and concisely.
+If the answer is spread across multiple points, synthesize the key info into a complete explanation.
+Do not mention documents or chunking. Just answer as if you know the topic.
+
+Document Content:
+{chr(10).join(top_chunks)}
 
 Question: {question}
 Answer:"""
+
         import openai
         openai.api_key = OPENAI_API_KEY
         print(f"Processing question: {question} from {user_email}")
