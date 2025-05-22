@@ -3,13 +3,14 @@ import requests
 from msal import ConfidentialClientApplication
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import pdfplumber, docx, json
 import faiss
 import numpy as np
 import datetime
+import glob
 
 # === Load secrets from environment ===
 load_dotenv()
@@ -144,7 +145,6 @@ def sync_sharepoint():
             print(f"⏭️ Skipping already processed file: {name}")
             continue
 
-        # Only download if not already processed
         print(f"📥 Downloading: {name}")
         download_url = file.get("@microsoft.graph.downloadUrl")
         file_data = requests.get(download_url)
@@ -171,8 +171,6 @@ def sync_sharepoint():
 
     print("✅ Sync complete. Files processed and saved to ./documents/")
 
-import glob
-
 # Load internal user list
 INTERNAL_USER_FILE = "internal_users.json"
 if os.path.exists(INTERNAL_USER_FILE):
@@ -180,10 +178,6 @@ if os.path.exists(INTERNAL_USER_FILE):
         INTERNAL_USERS = json.load(f)
 else:
     INTERNAL_USERS = {}
-
-# Admin panel setup for managing internal users
-from fastapi import Request, Form
-from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -206,7 +200,6 @@ async def upload_file(file: UploadFile = File(...)):
         chunks = chunk_text(text)
         vectors = embed_texts(chunks)
 
-        # Save to public folder by default
         subfolder = Path(DESTINATION_FOLDER) / "public"
         subfolder.mkdir(parents=True, exist_ok=True)
         with open(subfolder / f"{document_name}.json", "w", encoding="utf-8") as f:
@@ -220,7 +213,6 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.post("/sync-now")
 def trigger_sync():
     try:
@@ -232,9 +224,6 @@ def trigger_sync():
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
-        from fastapi import Form
-        from typing import List
-
         def load_chunks_and_index(folder):
             results = []
             paths = glob.glob(f"{folder}/*.json")
@@ -290,7 +279,6 @@ Answer:"""
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
     users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
@@ -322,7 +310,6 @@ def remove_internal_user(email: str = Form(...)):
             json.dump(INTERNAL_USERS, f, indent=2)
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
-
 
 @app.get("/sync-latest")
 def get_sync_latest():
