@@ -210,10 +210,11 @@ async def upload_file(file: UploadFile = File(...)):
         faiss.write_index(index, str(subfolder / f"{document_name}.index"))
 
         return {"message": f"Document '{document_name}' uploaded and processed."}
-except Exception as e:
-    print("❌ Upload failed:", str(e))
-    return {"error": str(e)}
+    except Exception as e:
+        print("❌ Upload failed:", str(e))
+        return {"error": str(e)}
 
+# ... [rest of the code unchanged] ...
 
 @app.post("/sync-now")
 def trigger_sync():
