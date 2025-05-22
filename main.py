@@ -213,7 +213,6 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         print("❌ Upload failed:", str(e))
         return {"error": str(e)}
-
 # ... [rest of the code unchanged] ...
 
 @app.post("/sync-now")
