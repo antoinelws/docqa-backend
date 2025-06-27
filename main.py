@@ -7,7 +7,6 @@ from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from sow_estimator import router as estimator_router
-app.include_router(estimator_router)
 import pdfplumber, docx, json
 import faiss
 import numpy as np
@@ -182,6 +181,8 @@ else:
     INTERNAL_USERS = {}
 
 app = FastAPI()
+
+app.include_router(estimator_router)
 
 app.add_middleware(
     CORSMiddleware,
