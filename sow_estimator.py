@@ -127,71 +127,60 @@ class NewCarrierEstimateRequest(BaseModel):
     serpcarUsage: str
     shipFrom: List[str]
     shipTo: List[str]
+    shipToVolume: str
+    shiperpVersion: str
+    shipmentScreenString: str
 
 @router.post("/estimate/new_carrier")
 async def estimate_new_carrier(data: NewCarrierEstimateRequest):
-    score = 0
+    line_19 = 60 if len(data.features) == 0 else 40
 
-    # 1. Feature weights (up to 40 points)
-    feature_weights = {
-        "Shipping & Labeling": 5,
-        "Rate quoting": 3,
-        "Tracking": 3,
-        "Proof of Delivery": 2,
-        "Hazmat shipping": 4,
-        "End of day manifest": 2,
-        "Create Request for Pickup": 3,
-        "Cancel Request for Pickup": 2,
-        "Address Validation": 2,
-        "Electronic Trade Documents": 4
-    }
-    feature_score = sum(feature_weights.get(f, 0) for f in data.features)
-    feature_score = min(feature_score, 40)
-    score += feature_score
-
-    # 2. System weights (up to 30 points)
-    system_weights = {
-        "ECC": 10,
-        "EWM": 10,
-        "TM": 10
-    }
-    system_score = sum(system_weights.get(s, 0) for s in data.systemUsed)
-    system_score = min(system_score, 30)
-    score += system_score
-
-    # 3. Screen weights (up to 20 points)
-    screen_weights = {
-        "Small Parcel Screen": 6,
-        "Planning or TUV Screen": 8,
-        "SAP TM Screen": 6,
-        "Other": 4
-    }
-    screen_score = sum(screen_weights.get(s, 0) for s in data.shipmentScreens)
-    screen_score = min(screen_score, 20)
-    score += screen_score
-
-    # 4. Enhancement count weight (up to 10 points)
-    if data.zEnhancements <= 5:
-        score += 2
-    elif data.zEnhancements <= 15:
-        score += 5
-    elif data.zEnhancements <= 50:
-        score += 8
+    if data.onlineOrOffline.lower() == "online":
+        line_20 = 0 if data.zEnhancements == 0 else 40  # Adjust value if needed
     else:
-        score += 10
+        line_20 = 0
 
-    # 5. Online vs Offline weight (up to 5 points)
-    if data.onlineOrOffline == "Offline":
-        score += 5
-    else:
-        score += 2
+    line_21 = -16 if data.serpcarUsage.lower() == "yes" else 0
 
-    # 6. Other impact factors (up to 13 points)
-    if data.serpcarUsage == "Yes":
-        score += 4
-    if len(data.shipFrom) > 1:
-        score += 4
-    if len(data.shipTo) > 1:
-        score += 5
+    shipto_map = {
+        "less than 10": 0,
+        "between 10 and 50": 16,
+        "more than 50": 32,
+        "i'm not sure": 8
+    }
+    line_22 = shipto_map.get(data.shipToVolume.strip().lower(), 0)
 
-    return {"total_effort": round(score)}
+    line_23 = 0 if data.onlineOrOffline.lower() == "online" else -32
+
+    line_24 = 16 if len(data.shipFrom) > 3 else 0
+
+    version_map = {
+        "above 4.5": 0,
+        "between 4.0 and 4.5": 0,
+        "between 3.6 and 3.9": 8,
+        "lower than 3.6": 12
+    }
+    line_26 = version_map.get(data.shiperpVersion.strip().lower(), 0)
+
+    comma_count = data.shipmentScreenString.count(",")
+    line_28 = 8 if comma_count >= 1 else 0
+
+    total_effort = sum([
+        line_19, line_20, line_21, line_22, line_23,
+        line_24, 0, line_26, 0, line_28
+    ])
+
+    return {
+        "total_effort": max(0, round(total_effort)),
+        "details": {
+            "E19_Features": line_19,
+            "E20_Enhancements_Online": line_20,
+            "E21_SERPCAR": line_21,
+            "E22_ShipToVolume": line_22,
+            "E23_OnlineImpact": line_23,
+            "E24_ShipFromCount": line_24,
+            "E26_ShipERPVersion": line_26,
+            "E28_ShipmentScreensCount": line_28
+        },
+        "input_snapshot": data.dict()
+    }
