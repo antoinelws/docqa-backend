@@ -1,7 +1,10 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
+from typing import List
 
 router = APIRouter()
+
+# ========== SOW Estimator (SOW Internal Estimation tab) ==========
 
 class SOWInput(BaseModel):
     ecc_version: float
@@ -12,7 +15,6 @@ class SOWInput(BaseModel):
     corrections: float
     configuration: float
 
-# Step 1 mapping logic
 def map_to_output_value(category: str, value):
     if category == "enhancements":
         if value <= 15:
@@ -40,7 +42,6 @@ def map_to_output_value(category: str, value):
         return value.capitalize()
     return value
 
-# Step 2 ratio mapping
 def get_ratio(category: str, output_value: str):
     ratios = {
         ("Number of enhancement", "Low"): 1,
@@ -63,21 +64,18 @@ def get_ratio(category: str, output_value: str):
 
 @router.post("/sow-estimate")
 async def estimate_sow(request: Request, input_data: SOWInput):
-    # Step 1 output value determination
     enhancement_level = map_to_output_value("enhancements", input_data.enhancements)
     ecc_level = map_to_output_value("ecc_version", input_data.ecc_version)
     ewm_level = map_to_output_value("ewm_version", input_data.ewm_version)
     test_case_level = map_to_output_value("test_cases", input_data.test_cases)
     rating_level = map_to_output_value("customer_rating", input_data.customer_rating)
 
-    # Step 2 ratio lookup
     enhancement_ratio = get_ratio("Number of enhancement", enhancement_level)
     ecc_ratio = get_ratio("ShipERP Version ECC", ecc_level)
     ewm_ratio = get_ratio("ShipERP Version EWM", ewm_level)
     test_case_ratio = get_ratio("Test cases", test_case_level)
     rating_ratio = get_ratio("Customer Rating", rating_level)
 
-    # Ratio calculations
     ratio_sum = sum([ecc_ratio, ewm_ratio, enhancement_ratio, test_case_ratio, rating_ratio])
     ratio_from = ratio_sum / 4.5
     ratio_to = ratio_sum / 3
@@ -85,7 +83,6 @@ async def estimate_sow(request: Request, input_data: SOWInput):
     b14 = input_data.corrections
     b15 = input_data.configuration
 
-    # From estimates
     b25 = b14 * ratio_from
     b26 = b15 * ratio_from
     b27 = b15 * 0.3 * ratio_from
@@ -94,7 +91,6 @@ async def estimate_sow(request: Request, input_data: SOWInput):
     b30 = sum([b25, b26, b27, b28, b29]) * 0.2
     b_total = sum([b25, b26, b27, b28, b29, b30])
 
-    # To estimates
     c25 = b14 * ratio_to
     c26 = b15 * ratio_to
     c27 = b15 * 0.3 * ratio_to
@@ -115,3 +111,87 @@ async def estimate_sow(request: Request, input_data: SOWInput):
             "PM hours": [round(b30), round(c30)]
         }
     }
+
+
+# ========== New Carrier Estimator (New Carrier tab) ==========
+
+class NewCarrierEstimateRequest(BaseModel):
+    carrierName: str
+    sapVersion: str
+    abapVersion: str
+    zEnhancements: int
+    onlineOrOffline: str
+    features: List[str]
+    systemUsed: List[str]
+    shipmentScreens: List[str]
+    serpcarUsage: str
+    shipFrom: List[str]
+    shipTo: List[str]
+
+@router.post("/estimate/new_carrier")
+async def estimate_new_carrier(data: NewCarrierEstimateRequest):
+    score = 0
+
+    # 1. Feature weights (up to 40 points)
+    feature_weights = {
+        "Shipping & Labeling": 5,
+        "Rate quoting": 3,
+        "Tracking": 3,
+        "Proof of Delivery": 2,
+        "Hazmat shipping": 4,
+        "End of day manifest": 2,
+        "Create Request for Pickup": 3,
+        "Cancel Request for Pickup": 2,
+        "Address Validation": 2,
+        "Electronic Trade Documents": 4
+    }
+    feature_score = sum(feature_weights.get(f, 0) for f in data.features)
+    feature_score = min(feature_score, 40)
+    score += feature_score
+
+    # 2. System weights (up to 30 points)
+    system_weights = {
+        "ECC": 10,
+        "EWM": 10,
+        "TM": 10
+    }
+    system_score = sum(system_weights.get(s, 0) for s in data.systemUsed)
+    system_score = min(system_score, 30)
+    score += system_score
+
+    # 3. Screen weights (up to 20 points)
+    screen_weights = {
+        "Small Parcel Screen": 6,
+        "Planning or TUV Screen": 8,
+        "SAP TM Screen": 6,
+        "Other": 4
+    }
+    screen_score = sum(screen_weights.get(s, 0) for s in data.shipmentScreens)
+    screen_score = min(screen_score, 20)
+    score += screen_score
+
+    # 4. Enhancement count weight (up to 10 points)
+    if data.zEnhancements <= 5:
+        score += 2
+    elif data.zEnhancements <= 15:
+        score += 5
+    elif data.zEnhancements <= 50:
+        score += 8
+    else:
+        score += 10
+
+    # 5. Online vs Offline weight (up to 5 points)
+    if data.onlineOrOffline == "Offline":
+        score += 5
+    else:
+        score += 2
+
+    # 6. Other impact factors (up to 13 points)
+    if data.serpcarUsage == "Yes":
+        score += 4
+    if len(data.shipFrom) > 1:
+        score += 4
+    if len(data.shipTo) > 1:
+        score += 5
+
+    return {"total_effort": round(score)}
