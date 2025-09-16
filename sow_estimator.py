@@ -171,7 +171,7 @@ async def estimate_new_carrier(data: NewCarrierEstimateRequest):
     ])
 
     return {
-        "total_effort": max(0, round(total_effort)),
+        "total_effort": max(4, round(total_effort)),   # enforce minimum of 4 hours
         "details": {
             "E19_Features": line_19,
             "E20_Enhancements_Online": line_20,
