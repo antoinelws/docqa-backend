@@ -169,7 +169,7 @@ async def estimate_new_carrier(data: NewCarrierEstimateRequest):
 
     total_effort = sum([
         line_19, line_20, line_21, line_22, line_23,
-        line_24, 0, line_26, 0 #, line_28
+        line_24, 0, line_26, 0, line_28
     ])
 
     return {
