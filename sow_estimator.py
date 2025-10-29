@@ -161,8 +161,9 @@ async def estimate_new_carrier(data: NewCarrierEstimateRequest):
         "lower than 3.6": 12
     }
     line_26 = version_map.get(data.shiperpVersion.strip().lower(), 0)
-
-    if not data.shipmentScreenString == " " or not data.shipmentScreenString == "":
+    
+    print(repr(data.shipmentScreenString))
+    if data.shipmentScreenString != "":
         comma_count = data.shipmentScreenString.count(",")
         line_28 = ( comma_count + 1 ) * 8
 
