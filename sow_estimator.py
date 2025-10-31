@@ -162,11 +162,10 @@ async def estimate_new_carrier(data: NewCarrierEstimateRequest):
     }
     line_26 = version_map.get(data.shiperpVersion.strip().lower(), 0)
 
-    # if data.shipmentScreenString != "":
-    comma_count = data.shipmentScreenString.count(",")
-    line_28 = ( comma_count + 1 ) * 8 
-    
-    if not data.shipmentScreens:
+    if data.shipmentScreens:
+        comma_count = data.shipmentScreenString.count(",")
+        line_28 = ( comma_count + 1 ) * 8 
+    else:
         line_28 = 0
 
     total_effort = sum([
