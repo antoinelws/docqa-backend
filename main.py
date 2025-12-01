@@ -337,6 +337,7 @@ async def ask_from_slack(request: Request):
     form = await request.form()
     question = form.get("text")
     user_email = form.get("user_email") or "default@shiperp.com"  # fallback
+    user_email = "default@shiperp.com"  # fallback
     try:
         answer = ask_question(question=question, user_email=user_email)
         return {"response_type": "in_channel", "text": answer["answer"]}
@@ -349,3 +350,4 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
