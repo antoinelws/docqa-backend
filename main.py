@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from sow_estimator import router as estimator_router
+from fastapi import BackgroundTasks
+import requests  # already used for SharePoint, so you probably have it
 import pdfplumber, docx, json
 import faiss
 import numpy as np
@@ -405,6 +407,7 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
 
 
 
