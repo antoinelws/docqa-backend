@@ -347,22 +347,30 @@ async def ask_from_slack(request: Request):
     form = await request.form()
     question = form.get("text") or ""
 
-    # 👉 Slack s'identifie comme un user interne
-    user_email = "default@erp-is.com"  # IMPORTANT: bien en @erp-is.com
+    # Identité utilisée pour toutes les requêtes Slack
+    user_email = "default@erp-is.com"
+
+    print("[DEBUG][SLACK] incoming text:", question)
+    print("[DEBUG][SLACK] using email:", user_email)
 
     try:
         answer = ask_question(question=question, user_email=user_email)
-        # ask_question renvoie {"answer": "..."} ou {"error": "..."}
-        text = answer.get("answer") or answer.get("error") or "No answer"
+        print("[DEBUG][SLACK] answer dict:", answer)
+
+        # ask_question retourne {"answer": "..."} ou {"error": "..."}
+        text = answer.get("answer") or answer.get("error") or "No answer from backend"
+
         return {
             "response_type": "in_channel",
             "text": text
         }
     except Exception as e:
+        print("[DEBUG][SLACK] exception:", e)
         return {
             "response_type": "ephemeral",
             "text": f"Error: {str(e)}"
         }
+
 
 
 
@@ -371,6 +379,7 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
 
 
 
