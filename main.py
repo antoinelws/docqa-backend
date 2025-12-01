@@ -342,34 +342,60 @@ def remove_internal_user(email: str = Form(...)):
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
-@app.post("/ask-from-slack")
-async def ask_from_slack(request: Request):
-    form = await request.form()
-    question = form.get("text") or ""
+def post_to_slack(response_url: str, text: str):
+    """
+    Send a follow-up message to Slack using the response_url.
+    """
+    try:
+        requests.post(
+            response_url,
+            json={
+                "response_type": "in_channel",
+                "text": text
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print("[DEBUG][SLACK] error posting follow-up:", e)
 
-    # Identité utilisée pour toutes les requêtes Slack
-    user_email = "default@erp-is.com"
 
-    print("[DEBUG][SLACK] incoming text:", question)
-    print("[DEBUG][SLACK] using email:", user_email)
+def process_slack_question(question: str, response_url: str):
+    """
+    Background job: call ask_question and then send the result to Slack.
+    """
+    user_email = "default@erp-is.com"  # internal identity for Slack
+    print("[DEBUG][SLACK] BG processing question:", question, "from", user_email)
 
     try:
         answer = ask_question(question=question, user_email=user_email)
-        print("[DEBUG][SLACK] answer dict:", answer)
-
-        # ask_question retourne {"answer": "..."} ou {"error": "..."}
-        text = answer.get("answer") or answer.get("error") or "No answer from backend"
-
-        return {
-            "response_type": "in_channel",
-            "text": text
-        }
+        print("[DEBUG][SLACK] BG answer dict:", answer)
+        text = answer.get("answer") or answer.get("error") or "No answer from backend."
     except Exception as e:
-        print("[DEBUG][SLACK] exception:", e)
-        return {
-            "response_type": "ephemeral",
-            "text": f"Error: {str(e)}"
-        }
+        text = f"Error while processing: {str(e)}"
+
+    if response_url:
+        post_to_slack(response_url, text)
+
+
+@app.post("/ask-from-slack")
+async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
+    form = await request.form()
+    question = form.get("text") or ""
+    response_url = form.get("response_url")  # Slack gives us this
+
+    print("[DEBUG][SLACK] incoming text:", question)
+    print("[DEBUG][SLACK] response_url:", response_url)
+
+    # Schedule background processing (does embeddings + GPT)
+    if response_url:
+        background_tasks.add_task(process_slack_question, question, response_url)
+
+    # Immediate response to avoid Slack operation_timeout
+    return {
+        "response_type": "ephemeral",
+        "text": "Got it, I’m generating an answer…"
+    }
+
 
 
 
@@ -379,6 +405,7 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
 
 
 
