@@ -253,6 +253,9 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         # RULE 2 — emails ajoutés via /admin gardent aussi l'accès interne
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
+        print("[DEBUG] ask_question called with:", user_email)
+        print("[DEBUG] access_folders:", access_folders)
+    
 
         # Embedding de la question
         question_vec = embed_texts([question])[0]
@@ -339,24 +342,28 @@ def remove_internal_user(email: str = Form(...)):
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
-@app.get("/sync-latest")
-def get_sync_latest():
-    latest = get_last_log_entry()
-    if not latest:
-        return JSONResponse(status_code=404, content={"error": "No sync history found."})
-    return latest
-
 @app.post("/ask-from-slack")
 async def ask_from_slack(request: Request):
     form = await request.form()
-    question = form.get("text")
-    user_email = form.get("user_email") or "default@shiperp.com"  # fallback
-    user_email = "default@shiperp.com"  # fallback
+    question = form.get("text") or ""
+
+    # 👉 Slack s'identifie comme un user interne
+    user_email = "default@erp-is.com"  # IMPORTANT: bien en @erp-is.com
+
     try:
         answer = ask_question(question=question, user_email=user_email)
-        return {"response_type": "in_channel", "text": answer["answer"]}
+        # ask_question renvoie {"answer": "..."} ou {"error": "..."}
+        text = answer.get("answer") or answer.get("error") or "No answer"
+        return {
+            "response_type": "in_channel",
+            "text": text
+        }
     except Exception as e:
-        return {"response_type": "ephemeral", "text": f"Error: {str(e)}"}
+        return {
+            "response_type": "ephemeral",
+            "text": f"Error: {str(e)}"
+        }
+
 
 
 try:
@@ -364,5 +371,6 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
 
 
