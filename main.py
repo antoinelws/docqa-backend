@@ -243,21 +243,34 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                 results.append((chunks, index))
             return results
 
+        # Dossiers accessibles par défaut (public)
         access_folders = ["documents/public"]
-        if INTERNAL_USERS.get(user_email):
+
+        # RULE 1 — tous les emails ERP-IS ont accès aux docs internes
+        if user_email and user_email.endswith("@erp-is.com"):
             access_folders.append("documents/internal")
 
+        # RULE 2 — emails ajoutés via /admin gardent aussi l'accès interne
+        elif INTERNAL_USERS.get(user_email):
+            access_folders.append("documents/internal")
+
+        # Embedding de la question
         question_vec = embed_texts([question])[0]
         combined_chunks = []
 
+        # Recherche FAISS dans tous les dossiers autorisés
         for folder in access_folders:
             data = load_chunks_and_index(folder)
             for chunks, index in data:
-                D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
+                D, I = index.search(
+                    np.array([question_vec]).astype("float32"),
+                    k=3
+                )
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
                         combined_chunks.append((score, chunks[idx]))
 
+        # On garde les meilleurs chunks
         combined_chunks.sort(key=lambda x: x[0])
         top_chunks = [chunk for _, chunk in combined_chunks[:5]]
 
@@ -292,6 +305,7 @@ Answer:"""
         return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
@@ -350,4 +364,5 @@ try:
     sync_sharepoint()
 except Exception as e:
     print(f"❌ SharePoint sync failed: {e}")
+
 
