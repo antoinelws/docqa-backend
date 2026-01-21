@@ -255,18 +255,44 @@ def chunk_text(text: str, max_chars: int = 1200):
 
 def embed_texts(texts, batch_size: int = 64):
     """
-    Embeds in batches to reduce peak RAM and request size.
-    Note: This uses the legacy openai-python interface (openai.Embedding.create).
+    Safe embedding with filtering + batching.
+    Prevents invalid input errors from OpenAI.
     """
     import openai
     openai.api_key = OPENAI_API_KEY
 
+    # 1) Sanitize input
+    clean_texts = []
+    for t in texts:
+        if not t:
+            continue
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if len(t) < 5:
+            continue
+        # hard cap to avoid oversized Slack blocks
+        if len(t) > 8000:
+            t = t[:8000]
+        clean_texts.append(t)
+
+    if not clean_texts:
+        return []
+
+    # 2) Batch embed
     all_vectors = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        response = openai.Embedding.create(input=batch, model=EMBEDDING_MODEL)
+    for i in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[i:i + batch_size]
+
+        response = openai.Embedding.create(
+            input=batch,
+            model=EMBEDDING_MODEL
+        )
+
         all_vectors.extend([d["embedding"] for d in response["data"]])
+
     return all_vectors
+
 
 
 def log_sync_activity(filename, user_name, user_email):
@@ -336,6 +362,11 @@ def sync_sharepoint():
             continue
 
         vectors = embed_texts(chunks)
+
+        if not vectors:
+            print(f"Skipping embedding for {name}: no valid chunks")
+            continue
+
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
@@ -427,6 +458,9 @@ async def upload_file(file: UploadFile = File(...)):
             return {"error": "No text extracted from uploaded file."}
 
         vectors = embed_texts(chunks)
+
+        if not vectors:
+            return {"error": "No valid text to embed in this document."}
 
         subfolder = Path(DESTINATION_FOLDER) / "public"
         subfolder.mkdir(parents=True, exist_ok=True)
@@ -681,6 +715,7 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
+
 
 
 
