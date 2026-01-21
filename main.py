@@ -75,11 +75,158 @@ def extract_text(filename: str, content: bytes) -> str:
             tmp.flush()
             doc = docx.Document(tmp.name)
             return "\n".join(p.text for p in doc.paragraphs)
+    elif ext == "txt":
+    try:
+        return content.decode("utf-8", errors="ignore")
+    except Exception:
 
     return ""
 
+import re
+import html
 
-def chunk_text(text: str, max_chars: int = 1000):
+# Matches lines like:
+# [2025-12-23T19:43:15.498Z] U28LYCZ2Q: Message text...
+SLACK_LINE_RE = re.compile(
+    r'^\[(\d{4}-\d{2}-\d{2}T[0-9:\.]+Z)\]\s+([A-Z0-9]+):\s*(.*)$'
+)
+
+def clean_slack_markup(s: str) -> str:
+    """
+    Normalize common Slack export markup so embeddings are more semantic.
+    """
+    if not s:
+        return ""
+
+    # Decode HTML entities (&amp; etc.)
+    s = html.unescape(s)
+
+    # Remove Slack broadcast tags
+    s = s.replace("<!channel>", "@channel").replace("<!here>", "@here").replace("<!everyone>", "@everyone")
+
+    # Replace user mentions like <@U123ABC> -> @U123ABC (keeps token but removes brackets)
+    s = re.sub(r"<@([A-Z0-9]+)>", r"@\1", s)
+
+    # Convert links like <https://x|label> -> label (https://x)
+    s = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2 (\1)", s)
+
+    # Convert links like <https://x> -> https://x
+    s = re.sub(r"<(https?://[^>]+)>", r"\1", s)
+
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s
+
+
+def looks_like_slack_export(text: str) -> bool:
+    """
+    Detect Slack export format by checking for multiple timestamp+user lines.
+    """
+    if not text:
+        return False
+    lines = text.splitlines()
+    hits = 0
+    for ln in lines[:2000]:  # check first chunk only
+        if SLACK_LINE_RE.match(ln.strip()):
+            hits += 1
+            if hits >= 3:
+                return True
+    return False
+
+
+def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
+    """
+    Chunk Slack export by message boundaries, keeping thread replies with the message.
+
+    Strategy:
+    - Parse each message line into (timestamp, user, body)
+    - Treat lines that start with "↳" as replies; attach them to the previous message block
+    - Produce chunks roughly <= max_chars, but never split a single message block
+    """
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    messages = []
+    current = None  # dict: {ts, user, body, replies[]}
+
+    for raw in lines:
+        ln = raw.strip()
+        if not ln:
+            continue
+
+        # Thread reply line
+        if ln.startswith("↳") and current is not None:
+            reply_text = clean_slack_markup(ln.lstrip("↳").strip())
+            if reply_text:
+                current["replies"].append(reply_text)
+            continue
+
+        m = SLACK_LINE_RE.match(ln)
+        if m:
+            # flush previous message
+            if current is not None:
+                messages.append(current)
+
+            ts, user, body = m.group(1), m.group(2), m.group(3)
+            current = {
+                "ts": ts,
+                "user": user,
+                "body": clean_slack_markup(body),
+                "replies": []
+            }
+        else:
+            # Continuation line (PDF wraps, or multi-line message)
+            if current is not None:
+                extra = clean_slack_markup(ln)
+                if extra:
+                    current["body"] = (current["body"] + " " + extra).strip()
+
+    if current is not None:
+        messages.append(current)
+
+    # Now pack messages into chunks
+    chunks = []
+    buf = ""
+
+    def format_msg(msg):
+        base = f"{msg['ts']} {msg['user']}: {msg['body']}".strip()
+        if msg["replies"]:
+            replies = "\n".join([f"  reply: {r}" for r in msg["replies"]])
+            return base + "\n" + replies
+        return base
+
+    for msg in messages:
+        block = format_msg(msg)
+        if not block:
+            continue
+
+        # If adding this would exceed max_chars, flush buffer first
+        if buf and (len(buf) + len(block) + 2) > max_chars:
+            chunks.append(buf.strip())
+            buf = ""
+
+        # If a single block is huge, store it alone
+        if len(block) > max_chars and not buf:
+            chunks.append(block.strip())
+            continue
+
+        buf += (block + "\n\n")
+
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    return chunks
+
+
+def chunk_text(text: str, max_chars: int = 1200):
+    """
+    Auto-chunk:
+    - If the document looks like a Slack export, chunk by Slack message boundaries.
+    - Otherwise, fall back to a simple sentence-ish chunking.
+    """
+    if looks_like_slack_export(text):
+        return chunk_slack_export(text, max_chars=max_chars)
+
+    # Fallback for normal docs
     sentences = text.split(". ")
     chunks, chunk = [], ""
     for sentence in sentences:
@@ -88,7 +235,7 @@ def chunk_text(text: str, max_chars: int = 1000):
         else:
             chunks.append(chunk.strip())
             chunk = sentence + ". "
-    if chunk:
+    if chunk.strip():
         chunks.append(chunk.strip())
     return chunks
 
@@ -140,7 +287,7 @@ def sync_sharepoint():
             continue
 
         ext = name.lower().split(".")[-1]
-        if ext not in ["pdf", "docx"]:
+        if ext not in ["pdf", "docx", "txt"]:
             print(f"Skipping unsupported file: {name}")
             continue
 
@@ -491,3 +638,4 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
+
