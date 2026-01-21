@@ -219,6 +219,16 @@ def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
 
     return chunks
 
+def keyword_hits(chunks, keywords):
+    """
+    Return chunks that contain any keyword literally (case-insensitive).
+    """
+    hits = []
+    for c in chunks:
+        lc = c.lower()
+        if any(k in lc for k in keywords):
+            hits.append(c)
+    return hits
 
 def chunk_text(text: str, max_chars: int = 1200):
     """
@@ -466,6 +476,8 @@ def trigger_sync(background_tasks: BackgroundTasks):
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
+        import re
+
         access_folders = ["documents/public"]
 
         # RULE 1 — all @erp-is.com emails can access internal docs
@@ -479,24 +491,51 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         print("[DEBUG] ask_question called with:", user_email)
         print("[DEBUG] access_folders:", access_folders)
 
-        # Embed question
+        # Embed question (semantic)
         question_vec = embed_texts([question])[0]
+
+        # Build literal tokens for keyword matching (Slack-friendly)
+        question_lc = (question or "").lower()
+
+        literal_tokens = set()
+        # numbers like 1964, 2024, 10000
+        literal_tokens.update(re.findall(r"\b\d{3,5}\b", question_lc))
+        # short tokens like axo, pid, sow, ups, fedex, oauth
+        literal_tokens.update(re.findall(r"\b[a-z]{2,10}\b", question_lc))
+
+        # Remove very common noise tokens to reduce false matches
+        stop = {"the", "and", "for", "with", "that", "this", "what", "was", "said", "about", "show", "messages", "mention"}
+        literal_tokens = {t for t in literal_tokens if t not in stop}
+
         combined_chunks = []
 
-        # FAISS search across allowed folders
         for folder in access_folders:
             data = load_folder_indexes(folder)
+
             for chunks, index in data:
+                # 1) Literal keyword pass
+                if literal_tokens:
+                    literal_matches = keyword_hits(chunks, literal_tokens)
+                    for c in literal_matches[:10]:  # cap to avoid flooding
+                        combined_chunks.append((0.0, c))  # force priority
+
+                # 2) Semantic FAISS pass
                 D, I = index.search(
                     np.array([question_vec]).astype("float32"),
-                    k=3
+                    k=8
                 )
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
-                        combined_chunks.append((score, chunks[idx]))
+                        combined_chunks.append((float(score), chunks[idx]))
 
-        combined_chunks.sort(key=lambda x: x[0])
-        top_chunks = [chunk for _, chunk in combined_chunks[:5]]
+        # Deduplicate while keeping best score
+        best = {}
+        for score, chunk in combined_chunks:
+            if chunk not in best or score < best[chunk]:
+                best[chunk] = score
+
+        ranked = sorted(best.items(), key=lambda x: x[1])
+        top_chunks = [chunk for chunk, _ in ranked[:8]]
 
         if not top_chunks:
             return {"answer": "No relevant content found."}
@@ -529,6 +568,7 @@ Answer:"""
 
     except Exception as e:
         return {"error": str(e)}
+
 
 
 # =========================
@@ -641,5 +681,6 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
+
 
 
