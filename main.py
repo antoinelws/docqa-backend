@@ -138,7 +138,7 @@ def looks_like_slack_export(text: str) -> bool:
     return False
 
 
-def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
+def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
     """
     Chunk Slack export by message boundaries, keeping thread replies with the message.
 
@@ -147,7 +147,8 @@ def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
     - Treat lines that start with "↳" as replies; attach them to the previous message block
     - Produce chunks roughly <= max_chars, but never split a single message block
     """
-    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    lines = [ln.rstrip("
+") for ln in (text or "").splitlines()]
     messages = []
     current = None  # dict: {ts, user, body, replies[]}
 
@@ -190,17 +191,18 @@ def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
     chunks = []
     buf = ""
 
-def format_msg(msg):
-    uid = msg["user"]
-    display = SLACK_USERS.get(uid, uid)  # if mapped, use first name; else keep ID
-    header = f"{display} ({uid})" if display != uid else uid
+    def format_msg(msg):
+        uid = msg["user"]
+        display = SLACK_USERS.get(uid, uid)  # if mapped, use first name; else keep ID
+        header = f"{display} ({uid})" if display != uid else uid
 
-    base = f"{msg['ts']} {header}: {msg['body']}".strip()
-    if msg["replies"]:
-        replies = "\n".join([f"  reply: {r}" for r in msg["replies"]])
-        return base + "\n" + replies
-    return base
-
+        base = f"{msg['ts']} {header}: {msg['body']}".strip()
+        if msg["replies"]:
+            replies = "
+".join([f"  reply: {r}" for r in msg["replies"]])
+            return base + "
+" + replies
+        return base
 
     for msg in messages:
         block = format_msg(msg)
@@ -217,7 +219,9 @@ def format_msg(msg):
             chunks.append(block.strip())
             continue
 
-        buf += (block + "\n\n")
+        buf += (block + "
+
+")
 
     if buf.strip():
         chunks.append(buf.strip())
@@ -225,15 +229,40 @@ def format_msg(msg):
     return chunks
 
 def keyword_hits(chunks, keywords):
-    """
-    Return chunks that contain any keyword literally (case-insensitive).
-    """
+    """Return chunks that contain any keyword literally (case-insensitive)."""
+    if not keywords:
+        return []
     hits = []
+    kw = [k.lower() for k in keywords if isinstance(k, str) and k]
     for c in chunks:
+        if not c:
+            continue
         lc = c.lower()
-        if any(k in lc for k in keywords):
+        if any(k in lc for k in kw):
             hits.append(c)
     return hits
+
+
+def trim_context(chunks, max_chars: int = 12000, max_chunk_chars: int = 2000):
+    """
+    Keep adding chunks until max_chars reached.
+    Prevents token/context overflow in ChatCompletion.
+    """
+    out = []
+    total = 0
+    for c in chunks:
+        if not c:
+            continue
+        c = c.strip()
+        if not c:
+            continue
+        if len(c) > max_chunk_chars:
+            c = c[:max_chunk_chars] + "…"
+        if total + len(c) + 2 > max_chars:
+            break
+        out.append(c)
+        total += len(c) + 2
+    return out
 
 def chunk_text(text: str, max_chars: int = 1200):
     """
@@ -502,6 +531,26 @@ async def upload_file(file: UploadFile = File(...)):
 # =========================
 # Sync now (background)
 # =========================
+@app.post("/sync-now")
+def trigger_sync(background_tasks: BackgroundTasks):
+    global sync_in_progress
+    if sync_in_progress:
+        return {"status": "busy", "message": "Sync already in progress."}
+
+    sync_in_progress = True
+
+    def run_and_release():
+        global sync_in_progress
+        try:
+            sync_sharepoint()
+        finally:
+            sync_in_progress = False
+            clear_index_cache()
+
+    background_tasks.add_task(run_and_release)
+    return {"status": "started", "message": "SharePoint sync started in background."}
+
+
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
@@ -523,22 +572,23 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         question_str = question or ""
         question_lc = question_str.lower()
 
-        # --- Identify a requested Slack user by ID or by name ---
-        # 1) Direct Slack IDs in question
-        user_ids = set(re.findall(r"\bU[A-Z0-9]{6,}\b", question_str))
+        # "show" mode: return excerpts directly (no GPT) to avoid context overflow
+        is_show_mode = any(
+            p in question_lc for p in [
+                "show messages", "show me", "list messages", "give me messages", "where was", "where were"
+            ]
+        )
 
-        # 2) Names in question -> map to Slack IDs
-        # We match whole words for names we know (e.g. "antoine")
+        # --- Identify a requested Slack user by ID or by name ---
+        user_ids = set(re.findall(r"\bU[A-Z0-9]{6,}\b", question_str))
         for name_lc, uid in SLACK_NAME_TO_ID.items():
             if re.search(rf"\b{re.escape(name_lc)}\b", question_lc):
                 user_ids.add(uid)
-
-        required_user_ids_lc = {uid.lower() for uid in user_ids}  # for filtering chunks
+        required_user_ids_lc = {uid.lower() for uid in user_ids}
 
         # --- Build literal tokens for hybrid search ---
-        numbers = set(re.findall(r"\b\d{3,6}\b", question_lc))          # 1964 etc
-        words = set(re.findall(r"\b[a-z]{2,20}\b", question_lc))        # billable, axo, celoxis
-        # Also include any Slack IDs as tokens (lowercase)
+        numbers = set(re.findall(r"\b\d{3,6}\b", question_lc))
+        words = set(re.findall(r"\b[a-z]{2,20}\b", question_lc))
         id_tokens = {uid.lower() for uid in user_ids}
 
         literal_tokens = set()
@@ -547,14 +597,18 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         literal_tokens |= id_tokens
 
         stop = {
-            "the","and","for","with","that","this","what","was","said","about",
-            "show","messages","mention","from","did","say","where","based","those",
-            "time","times"  # optional noise
+            "the", "and", "for", "with", "that", "this", "what", "was", "said", "about",
+            "show", "messages", "mention", "from", "did", "say", "where", "based", "those",
+            "time", "times"
         }
         literal_tokens = {t for t in literal_tokens if t not in stop}
 
         # Embed question (semantic)
-        question_vec = embed_texts([question])[0]
+        qvecs = embed_texts([question_str])
+        if not qvecs:
+            return {"answer": "No valid question content to embed."}
+        question_vec = qvecs[0]
+
         combined_chunks = []
 
         for folder in access_folders:
@@ -570,10 +624,10 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                 else:
                     filtered_chunks = chunks
 
-                # 1) Literal keyword pass (Slack-friendly)
+                # 1) Literal keyword pass
                 if literal_tokens:
                     literal_matches = keyword_hits(filtered_chunks, literal_tokens)
-                    for c in literal_matches[:30]:
+                    for c in literal_matches[:50]:
                         combined_chunks.append((0.0, c))
 
                 # 2) Semantic FAISS pass
@@ -581,7 +635,6 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
                         c = chunks[idx]
-                        # If user specified, enforce it on semantic results too
                         if required_user_ids_lc and not any(uid in c.lower() for uid in required_user_ids_lc):
                             continue
                         combined_chunks.append((float(score), c))
@@ -593,8 +646,24 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                 best[chunk] = score
 
         ranked = sorted(best.items(), key=lambda x: x[1])
-        top_chunks = [chunk for chunk, _ in ranked[:10]]
+        candidates = [chunk for chunk, _ in ranked]
 
+        if not candidates:
+            return {"answer": "No relevant content found."}
+
+        # Show mode: return top excerpts directly (no GPT)
+        if is_show_mode:
+            excerpts = trim_context(candidates[:40], max_chars=6000)
+            if not excerpts:
+                return {"answer": "No relevant content found."}
+            return {"answer": "Here are the most relevant messages:
+
+" + "
+
+".join(excerpts)}
+
+        # Otherwise: keep context within limits for GPT
+        top_chunks = trim_context(candidates[:60], max_chars=12000)
         if not top_chunks:
             return {"answer": "No relevant content found."}
 
@@ -607,7 +676,7 @@ If the user asked about a specific person, focus only on that person's messages.
 Document Content:
 {chr(10).join(top_chunks)}
 
-Question: {question}
+Question: {question_str}
 Answer:"""
 
         import openai
@@ -626,7 +695,6 @@ Answer:"""
 
     except Exception as e:
         return {"error": str(e)}
-
 
 
 # =========================
@@ -703,6 +771,8 @@ def process_slack_question(question: str, response_url: str):
 async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     question = form.get("text") or ""
+    # Strip Slack emoji aliases like :white_check_mark:
+    question = re.sub(r":[a-zA-Z0-9_+\-]+:", " ", question).strip()
     response_url = form.get("response_url")
 
     print("[DEBUG][SLACK] incoming text:", question)
@@ -739,7 +809,6 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
-
 
 
 
