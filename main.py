@@ -75,12 +75,15 @@ def extract_text(filename: str, content: bytes) -> str:
             tmp.flush()
             doc = docx.Document(tmp.name)
             return "\n".join(p.text for p in doc.paragraphs)
+
     elif ext == "txt":
-    try:
-        return content.decode("utf-8", errors="ignore")
-    except Exception:
+        try:
+            return content.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
     return ""
+
 
 import re
 import html
@@ -638,4 +641,5 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
+
 
