@@ -190,12 +190,17 @@ def chunk_slack_export(text: str, max_chars: int = 1200) -> list[str]:
     chunks = []
     buf = ""
 
-    def format_msg(msg):
-        base = f"{msg['ts']} {msg['user']}: {msg['body']}".strip()
-        if msg["replies"]:
-            replies = "\n".join([f"  reply: {r}" for r in msg["replies"]])
-            return base + "\n" + replies
-        return base
+def format_msg(msg):
+    uid = msg["user"]
+    display = SLACK_USERS.get(uid, uid)  # if mapped, use first name; else keep ID
+    header = f"{display} ({uid})" if display != uid else uid
+
+    base = f"{msg['ts']} {header}: {msg['body']}".strip()
+    if msg["replies"]:
+        replies = "\n".join([f"  reply: {r}" for r in msg["replies"]])
+        return base + "\n" + replies
+    return base
+
 
     for msg in messages:
         block = format_msg(msg)
@@ -391,6 +396,19 @@ if os.path.exists(INTERNAL_USER_FILE):
 else:
     INTERNAL_USERS = {}
 
+# Load Slack user ID -> name mapping
+SLACK_USERS_FILE = "slack_users.json"
+if os.path.exists(SLACK_USERS_FILE):
+    with open(SLACK_USERS_FILE, "r", encoding="utf-8") as f:
+        SLACK_USERS = json.load(f)
+else:
+    SLACK_USERS = {}
+
+# Precompute reverse map: "antoine" -> "U28LYCZ2Q"
+SLACK_NAME_TO_ID = {}
+for uid, name in SLACK_USERS.items():
+    if isinstance(uid, str) and isinstance(name, str) and name.strip():
+        SLACK_NAME_TO_ID[name.strip().lower()] = uid.strip()
 
 app = FastAPI()
 app.include_router(estimator_router)
@@ -484,29 +502,6 @@ async def upload_file(file: UploadFile = File(...)):
 # =========================
 # Sync now (background)
 # =========================
-@app.post("/sync-now")
-def trigger_sync(background_tasks: BackgroundTasks):
-    global sync_in_progress
-    if sync_in_progress:
-        return {"status": "busy", "message": "Sync already in progress."}
-
-    sync_in_progress = True
-
-    def run_and_release():
-        global sync_in_progress
-        try:
-            sync_sharepoint()
-        finally:
-            sync_in_progress = False
-            clear_index_cache()
-
-    background_tasks.add_task(run_and_release)
-    return {"status": "started", "message": "SharePoint sync started in background."}
-
-
-# =========================
-# Ask
-# =========================
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
@@ -525,51 +520,80 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         print("[DEBUG] ask_question called with:", user_email)
         print("[DEBUG] access_folders:", access_folders)
 
-        # Embed question (semantic)
-        question_vec = embed_texts([question])[0]
+        question_str = question or ""
+        question_lc = question_str.lower()
 
-        # Build literal tokens for keyword matching (Slack-friendly)
-        question_lc = (question or "").lower()
+        # --- Identify a requested Slack user by ID or by name ---
+        # 1) Direct Slack IDs in question
+        user_ids = set(re.findall(r"\bU[A-Z0-9]{6,}\b", question_str))
+
+        # 2) Names in question -> map to Slack IDs
+        # We match whole words for names we know (e.g. "antoine")
+        for name_lc, uid in SLACK_NAME_TO_ID.items():
+            if re.search(rf"\b{re.escape(name_lc)}\b", question_lc):
+                user_ids.add(uid)
+
+        required_user_ids_lc = {uid.lower() for uid in user_ids}  # for filtering chunks
+
+        # --- Build literal tokens for hybrid search ---
+        numbers = set(re.findall(r"\b\d{3,6}\b", question_lc))          # 1964 etc
+        words = set(re.findall(r"\b[a-z]{2,20}\b", question_lc))        # billable, axo, celoxis
+        # Also include any Slack IDs as tokens (lowercase)
+        id_tokens = {uid.lower() for uid in user_ids}
 
         literal_tokens = set()
-        # numbers like 1964, 2024, 10000
-        literal_tokens.update(re.findall(r"\b\d{3,5}\b", question_lc))
-        # short tokens like axo, pid, sow, ups, fedex, oauth
-        literal_tokens.update(re.findall(r"\b[a-z]{2,10}\b", question_lc))
+        literal_tokens |= numbers
+        literal_tokens |= words
+        literal_tokens |= id_tokens
 
-        # Remove very common noise tokens to reduce false matches
-        stop = {"the", "and", "for", "with", "that", "this", "what", "was", "said", "about", "show", "messages", "mention"}
+        stop = {
+            "the","and","for","with","that","this","what","was","said","about",
+            "show","messages","mention","from","did","say","where","based","those",
+            "time","times"  # optional noise
+        }
         literal_tokens = {t for t in literal_tokens if t not in stop}
 
+        # Embed question (semantic)
+        question_vec = embed_texts([question])[0]
         combined_chunks = []
 
         for folder in access_folders:
             data = load_folder_indexes(folder)
-
             for chunks, index in data:
-                # 1) Literal keyword pass
+
+                # If user specified, restrict chunks to those mentioning that user ID
+                if required_user_ids_lc:
+                    filtered_chunks = [
+                        c for c in chunks
+                        if any(uid in c.lower() for uid in required_user_ids_lc)
+                    ]
+                else:
+                    filtered_chunks = chunks
+
+                # 1) Literal keyword pass (Slack-friendly)
                 if literal_tokens:
-                    literal_matches = keyword_hits(chunks, literal_tokens)
-                    for c in literal_matches[:10]:  # cap to avoid flooding
-                        combined_chunks.append((0.0, c))  # force priority
+                    literal_matches = keyword_hits(filtered_chunks, literal_tokens)
+                    for c in literal_matches[:30]:
+                        combined_chunks.append((0.0, c))
 
                 # 2) Semantic FAISS pass
-                D, I = index.search(
-                    np.array([question_vec]).astype("float32"),
-                    k=8
-                )
+                D, I = index.search(np.array([question_vec]).astype("float32"), k=10)
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
-                        combined_chunks.append((float(score), chunks[idx]))
+                        c = chunks[idx]
+                        # If user specified, enforce it on semantic results too
+                        if required_user_ids_lc and not any(uid in c.lower() for uid in required_user_ids_lc):
+                            continue
+                        combined_chunks.append((float(score), c))
 
-        # Deduplicate while keeping best score
+        # Deduplicate keeping best score
         best = {}
         for score, chunk in combined_chunks:
             if chunk not in best or score < best[chunk]:
                 best[chunk] = score
 
         ranked = sorted(best.items(), key=lambda x: x[1])
-        top_chunks = [chunk for chunk, _ in ranked[:8]]
+        top_chunks = [chunk for chunk, _ in ranked[:10]]
 
         if not top_chunks:
             return {"answer": "No relevant content found."}
@@ -578,7 +602,7 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
 
 Based on the content provided below, answer the user's question clearly and concisely.
 If the answer is spread across multiple points, synthesize the key info into a complete explanation.
-Do not mention documents or chunking. Just answer as if you know the topic.
+If the user asked about a specific person, focus only on that person's messages.
 
 Document Content:
 {chr(10).join(top_chunks)}
@@ -595,7 +619,7 @@ Answer:"""
                 {"role": "system", "content": "You answer questions based on documents."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3
+            temperature=0.2
         )
 
         return {"answer": response.choices[0].message.content}
@@ -715,6 +739,7 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
+
 
 
 
