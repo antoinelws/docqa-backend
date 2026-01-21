@@ -7,6 +7,9 @@ import tempfile
 from pathlib import Path
 from functools import lru_cache
 
+import re
+import html
+
 import requests
 import pdfplumber
 import docx
@@ -85,14 +88,12 @@ def extract_text(filename: str, content: bytes) -> str:
     return ""
 
 
-import re
-import html
-
 # Matches lines like:
 # [2025-12-23T19:43:15.498Z] U28LYCZ2Q: Message text...
 SLACK_LINE_RE = re.compile(
     r'^\[(\d{4}-\d{2}-\d{2}T[0-9:\.]+Z)\]\s+([A-Z0-9]+):\s*(.*)$'
 )
+
 
 def clean_slack_markup(s: str) -> str:
     """
@@ -107,7 +108,7 @@ def clean_slack_markup(s: str) -> str:
     # Remove Slack broadcast tags
     s = s.replace("<!channel>", "@channel").replace("<!here>", "@here").replace("<!everyone>", "@everyone")
 
-    # Replace user mentions like <@U123ABC> -> @U123ABC (keeps token but removes brackets)
+    # Replace user mentions like <@U123ABC> -> @U123ABC
     s = re.sub(r"<@([A-Z0-9]+)>", r"@\1", s)
 
     # Convert links like <https://x|label> -> label (https://x)
@@ -130,7 +131,7 @@ def looks_like_slack_export(text: str) -> bool:
         return False
     lines = text.splitlines()
     hits = 0
-    for ln in lines[:2000]:  # check first chunk only
+    for ln in lines[:2000]:
         if SLACK_LINE_RE.match(ln.strip()):
             hits += 1
             if hits >= 3:
@@ -141,14 +142,8 @@ def looks_like_slack_export(text: str) -> bool:
 def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
     """
     Chunk Slack export by message boundaries, keeping thread replies with the message.
-
-    Strategy:
-    - Parse each message line into (timestamp, user, body)
-    - Treat lines that start with "↳" as replies; attach them to the previous message block
-    - Produce chunks roughly <= max_chars, but never split a single message block
     """
-    lines = [ln.rstrip("
-") for ln in (text or "").splitlines()]
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     messages = []
     current = None  # dict: {ts, user, body, replies[]}
 
@@ -166,7 +161,6 @@ def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
 
         m = SLACK_LINE_RE.match(ln)
         if m:
-            # flush previous message
             if current is not None:
                 messages.append(current)
 
@@ -178,7 +172,7 @@ def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
                 "replies": []
             }
         else:
-            # Continuation line (PDF wraps, or multi-line message)
+            # Continuation line
             if current is not None:
                 extra = clean_slack_markup(ln)
                 if extra:
@@ -187,21 +181,18 @@ def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
     if current is not None:
         messages.append(current)
 
-    # Now pack messages into chunks
     chunks = []
     buf = ""
 
     def format_msg(msg):
         uid = msg["user"]
-        display = SLACK_USERS.get(uid, uid)  # if mapped, use first name; else keep ID
+        display = SLACK_USERS.get(uid, uid)  # mapped name or raw ID
         header = f"{display} ({uid})" if display != uid else uid
 
         base = f"{msg['ts']} {header}: {msg['body']}".strip()
         if msg["replies"]:
-            replies = "
-".join([f"  reply: {r}" for r in msg["replies"]])
-            return base + "
-" + replies
+            replies = "\n".join([f"  reply: {r}" for r in msg["replies"]])
+            return base + "\n" + replies
         return base
 
     for msg in messages:
@@ -209,31 +200,30 @@ def chunk_slack_export(text: str, max_chars: int = 700) -> list[str]:
         if not block:
             continue
 
-        # If adding this would exceed max_chars, flush buffer first
         if buf and (len(buf) + len(block) + 2) > max_chars:
             chunks.append(buf.strip())
             buf = ""
 
-        # If a single block is huge, store it alone
         if len(block) > max_chars and not buf:
             chunks.append(block.strip())
             continue
 
-        buf += (block + "
-
-")
+        buf += (block + "\n\n")
 
     if buf.strip():
         chunks.append(buf.strip())
 
     return chunks
 
+
 def keyword_hits(chunks, keywords):
     """Return chunks that contain any keyword literally (case-insensitive)."""
     if not keywords:
         return []
-    hits = []
     kw = [k.lower() for k in keywords if isinstance(k, str) and k]
+    if not kw:
+        return []
+    hits = []
     for c in chunks:
         if not c:
             continue
@@ -264,16 +254,16 @@ def trim_context(chunks, max_chars: int = 12000, max_chunk_chars: int = 2000):
         total += len(c) + 2
     return out
 
+
 def chunk_text(text: str, max_chars: int = 1200):
     """
     Auto-chunk:
-    - If the document looks like a Slack export, chunk by Slack message boundaries.
-    - Otherwise, fall back to a simple sentence-ish chunking.
+    - If Slack export -> chunk by Slack message boundaries
+    - Else -> sentence-ish chunking
     """
     if looks_like_slack_export(text):
         return chunk_slack_export(text, max_chars=max_chars)
 
-    # Fallback for normal docs
     sentences = text.split(". ")
     chunks, chunk = [], ""
     for sentence in sentences:
@@ -295,17 +285,13 @@ def embed_texts(texts, batch_size: int = 64):
     import openai
     openai.api_key = OPENAI_API_KEY
 
-    # 1) Sanitize input
     clean_texts = []
     for t in texts:
-        if not t:
-            continue
-        if not isinstance(t, str):
+        if not t or not isinstance(t, str):
             continue
         t = t.strip()
         if len(t) < 5:
             continue
-        # hard cap to avoid oversized Slack blocks
         if len(t) > 8000:
             t = t[:8000]
         clean_texts.append(t)
@@ -313,20 +299,13 @@ def embed_texts(texts, batch_size: int = 64):
     if not clean_texts:
         return []
 
-    # 2) Batch embed
     all_vectors = []
     for i in range(0, len(clean_texts), batch_size):
         batch = clean_texts[i:i + batch_size]
-
-        response = openai.Embedding.create(
-            input=batch,
-            model=EMBEDDING_MODEL
-        )
-
+        response = openai.Embedding.create(input=batch, model=EMBEDDING_MODEL)
         all_vectors.extend([d["embedding"] for d in response["data"]])
 
     return all_vectors
-
 
 
 def log_sync_activity(filename, user_name, user_email):
@@ -396,11 +375,9 @@ def sync_sharepoint():
             continue
 
         vectors = embed_texts(chunks)
-
         if not vectors:
             print(f"Skipping embedding for {name}: no valid chunks")
             continue
-
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
@@ -433,11 +410,12 @@ if os.path.exists(SLACK_USERS_FILE):
 else:
     SLACK_USERS = {}
 
-# Precompute reverse map: "antoine" -> "U28LYCZ2Q"
+# Reverse map: "antoine" -> "U28LYCZ2Q"
 SLACK_NAME_TO_ID = {}
 for uid, name in SLACK_USERS.items():
     if isinstance(uid, str) and isinstance(name, str) and name.strip():
         SLACK_NAME_TO_ID[name.strip().lower()] = uid.strip()
+
 
 app = FastAPI()
 app.include_router(estimator_router)
@@ -453,16 +431,8 @@ app.add_middleware(
 sync_in_progress = False
 
 
-# =========================
-# Step 3: Cached index loader
-# =========================
 @lru_cache(maxsize=8)
 def load_folder_indexes(folder: str):
-    """
-    Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them.
-    Cache must be cleared after upload or sync.
-    Returns: List[(chunks: List[str], index: faiss.Index)]
-    """
     results = []
     paths = glob.glob(f"{folder}/*.json")
 
@@ -489,9 +459,6 @@ def clear_index_cache():
         print("Failed to clear index cache:", e)
 
 
-# =========================
-# Upload
-# =========================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
@@ -505,7 +472,6 @@ async def upload_file(file: UploadFile = File(...)):
             return {"error": "No text extracted from uploaded file."}
 
         vectors = embed_texts(chunks)
-
         if not vectors:
             return {"error": "No valid text to embed in this document."}
 
@@ -519,18 +485,14 @@ async def upload_file(file: UploadFile = File(...)):
         index.add(np.array(vectors).astype("float32"))
         faiss.write_index(index, str(subfolder / f"{document_name}.index"))
 
-        # New doc added => clear cache so /ask can see it
         clear_index_cache()
-
         return {"message": f"Document '{document_name}' uploaded and processed."}
+
     except Exception as e:
         print("Upload failed:", str(e))
         return {"error": str(e)}
 
 
-# =========================
-# Sync now (background)
-# =========================
 @app.post("/sync-now")
 def trigger_sync(background_tasks: BackgroundTasks):
     global sync_in_progress
@@ -554,15 +516,10 @@ def trigger_sync(background_tasks: BackgroundTasks):
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
-        import re
-
         access_folders = ["documents/public"]
 
-        # RULE 1 — all @erp-is.com emails can access internal docs
         if user_email and user_email.endswith("@erp-is.com"):
             access_folders.append("documents/internal")
-
-        # RULE 2 — emails added via /admin also have internal access
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
@@ -572,21 +529,20 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         question_str = question or ""
         question_lc = question_str.lower()
 
-        # "show" mode: return excerpts directly (no GPT) to avoid context overflow
         is_show_mode = any(
             p in question_lc for p in [
                 "show messages", "show me", "list messages", "give me messages", "where was", "where were"
             ]
         )
 
-        # --- Identify a requested Slack user by ID or by name ---
+        # User filter: Slack ID and/or first name
         user_ids = set(re.findall(r"\bU[A-Z0-9]{6,}\b", question_str))
         for name_lc, uid in SLACK_NAME_TO_ID.items():
             if re.search(rf"\b{re.escape(name_lc)}\b", question_lc):
                 user_ids.add(uid)
         required_user_ids_lc = {uid.lower() for uid in user_ids}
 
-        # --- Build literal tokens for hybrid search ---
+        # Literal tokens
         numbers = set(re.findall(r"\b\d{3,6}\b", question_lc))
         words = set(re.findall(r"\b[a-z]{2,20}\b", question_lc))
         id_tokens = {uid.lower() for uid in user_ids}
@@ -603,7 +559,7 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         }
         literal_tokens = {t for t in literal_tokens if t not in stop}
 
-        # Embed question (semantic)
+        # Semantic embedding
         qvecs = embed_texts([question_str])
         if not qvecs:
             return {"answer": "No valid question content to embed."}
@@ -615,7 +571,6 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
             data = load_folder_indexes(folder)
             for chunks, index in data:
 
-                # If user specified, restrict chunks to those mentioning that user ID
                 if required_user_ids_lc:
                     filtered_chunks = [
                         c for c in chunks
@@ -624,13 +579,13 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                 else:
                     filtered_chunks = chunks
 
-                # 1) Literal keyword pass
+                # Literal pass
                 if literal_tokens:
                     literal_matches = keyword_hits(filtered_chunks, literal_tokens)
                     for c in literal_matches[:50]:
                         combined_chunks.append((0.0, c))
 
-                # 2) Semantic FAISS pass
+                # Semantic pass
                 D, I = index.search(np.array([question_vec]).astype("float32"), k=10)
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
@@ -639,7 +594,7 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
                             continue
                         combined_chunks.append((float(score), c))
 
-        # Deduplicate keeping best score
+        # Deduplicate best score
         best = {}
         for score, chunk in combined_chunks:
             if chunk not in best or score < best[chunk]:
@@ -651,18 +606,12 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         if not candidates:
             return {"answer": "No relevant content found."}
 
-        # Show mode: return top excerpts directly (no GPT)
         if is_show_mode:
             excerpts = trim_context(candidates[:40], max_chars=6000)
             if not excerpts:
                 return {"answer": "No relevant content found."}
-            return {"answer": "Here are the most relevant messages:
+            return {"answer": "Here are the most relevant messages:\n\n" + "\n\n".join(excerpts)}
 
-" + "
-
-".join(excerpts)}
-
-        # Otherwise: keep context within limits for GPT
         top_chunks = trim_context(candidates[:60], max_chars=12000)
         if not top_chunks:
             return {"answer": "No relevant content found."}
@@ -697,9 +646,6 @@ Answer:"""
         return {"error": str(e)}
 
 
-# =========================
-# Admin pages
-# =========================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
     users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
@@ -739,9 +685,6 @@ def remove_internal_user(email: str = Form(...)):
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
 
-# =========================
-# Slack integration
-# =========================
 def post_to_slack(response_url: str, text: str):
     try:
         requests.post(
@@ -771,8 +714,10 @@ def process_slack_question(question: str, response_url: str):
 async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     question = form.get("text") or ""
+
     # Strip Slack emoji aliases like :white_check_mark:
     question = re.sub(r":[a-zA-Z0-9_+\-]+:", " ", question).strip()
+
     response_url = form.get("response_url")
 
     print("[DEBUG][SLACK] incoming text:", question)
@@ -784,12 +729,8 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     return {"response_type": "ephemeral", "text": "Got it, I’m generating an answer…"}
 
 
-# =========================
-# Startup: sync SharePoint (kept)
-# =========================
 @app.on_event("startup")
 async def startup_event():
-    # Start sync after the app boots (background)
     asyncio.create_task(startup_sync())
 
 
@@ -809,7 +750,3 @@ async def startup_sync():
         print(f"Startup sync failed: {e}")
     finally:
         sync_in_progress = False
-
-
-
-
