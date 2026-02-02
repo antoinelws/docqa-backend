@@ -6,6 +6,7 @@ import datetime
 import tempfile
 from pathlib import Path
 from functools import lru_cache
+from typing import Dict, List, Any
 
 import requests
 import pdfplumber
@@ -17,7 +18,7 @@ from msal import ConfidentialClientApplication
 
 from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sow_estimator import router as estimator_router
 
 
@@ -60,6 +61,9 @@ def authenticate():
 
 
 def extract_text(filename: str, content: bytes) -> str:
+    """
+    Extracts text from pdf/docx/txt.
+    """
     ext = filename.lower().split(".")[-1]
 
     if ext == "pdf":
@@ -75,6 +79,12 @@ def extract_text(filename: str, content: bytes) -> str:
             tmp.flush()
             doc = docx.Document(tmp.name)
             return "\n".join(p.text for p in doc.paragraphs)
+
+    elif ext == "txt":
+        try:
+            return content.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
     return ""
 
@@ -140,7 +150,7 @@ def sync_sharepoint():
             continue
 
         ext = name.lower().split(".")[-1]
-        if ext not in ["pdf", "docx"]:
+        if ext not in ["pdf", "docx", "txt"]:
             print(f"Skipping unsupported file: {name}")
             continue
 
@@ -212,19 +222,248 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# =========================
+# Conversation (per-user) - isolated feature
+# =========================
+
+CHAT_MODEL = "gpt-4"           # ou gpt-4o-mini
+CHAT_MAX_TURNS = 12
+CHAT_SUMMARY_TRIGGER = 18
+CHAT_CONTEXT_CHAR_BUDGET = 14000
+
+CHAT_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def _now_iso():
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
+    out = []
+    total = 0
+    for m in reversed(messages):
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        size = len(c) + 50
+        if total + size > budget_chars and out:
+            break
+        out.append({"role": m["role"], "content": c})
+        total += size
+    return list(reversed(out))
+
+
+def _get_user_state(user_id: str) -> Dict[str, Any]:
+    if user_id not in CHAT_STORE:
+        CHAT_STORE[user_id] = {"summary": "", "messages": []}
+    return CHAT_STORE[user_id]
+
+
+def _summarize_if_needed(user_id: str):
+    state = _get_user_state(user_id)
+    msgs = state["messages"]
+
+    if len(msgs) <= CHAT_SUMMARY_TRIGGER:
+        return
+
+    keep = msgs[-CHAT_MAX_TURNS:]
+    old = msgs[:-CHAT_MAX_TURNS]
+
+    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+    if not old_text.strip():
+        state["messages"] = keep
+        return
+
+    import openai
+    openai.api_key = OPENAI_API_KEY
+
+    summary_prompt = f"""You are maintaining a running summary of a chat.
+
+Current summary (may be empty):
+{state['summary']}
+
+New dialogue to summarize:
+{old_text}
+
+Update the summary. Keep it factual and concise. Preserve decisions, constraints, names, and open questions.
+"""
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": "You summarize chat history into a concise running memory."},
+                {"role": "user", "content": summary_prompt},
+            ],
+            temperature=0.2,
+        )
+        state["summary"] = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("[CHAT] summarization failed:", e)
+
+    state["messages"] = keep
+
+
+@app.post("/chat-api")
+async def chat_api(user_id: str = Form(...), message: str = Form(...)):
+    try:
+        user_id = (user_id or "").strip()
+        message = (message or "").strip()
+
+        if not user_id:
+            return JSONResponse({"error": "Missing user_id"}, status_code=400)
+        if not message:
+            return JSONResponse({"error": "Empty message"}, status_code=400)
+
+        state = _get_user_state(user_id)
+
+        state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
+
+        _summarize_if_needed(user_id)
+
+        summary = (state["summary"] or "").strip()
+        recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Maintain continuity across the conversation."},
+        ]
+        if summary:
+            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
+        messages.extend(recent)
+
+        import openai
+        openai.api_key = OPENAI_API_KEY
+
+        resp = openai.ChatCompletion.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.4,
+        )
+
+        answer = (resp.choices[0].message.content or "").strip()
+
+        state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
+
+        if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
+            state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
+
+        return {"answer": answer, "user_id": user_id}
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/chat-ui", response_class=HTMLResponse)
+def chat_ui():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Conversation Bot (Per User)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+    .row { display: flex; gap: 12px; margin-bottom: 12px; }
+    input, textarea, button { font-size: 14px; padding: 10px; }
+    input { flex: 1; }
+    textarea { width: 100%; height: 90px; }
+    #chat { border: 1px solid #ddd; padding: 12px; border-radius: 8px; height: 420px; overflow: auto; background: #fafafa; }
+    .msg { margin: 10px 0; }
+    .user { font-weight: bold; }
+    .assistant { font-weight: bold; }
+    .bubble { padding: 10px; border-radius: 10px; display: inline-block; max-width: 90%; white-space: pre-wrap; }
+    .b-user { background: #e8f0ff; }
+    .b-assistant { background: #e9ffe8; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+
+<h2>Conversation Bot (per user)</h2>
+<p class="muted">Cette page est séparée du bot Slack/one-shot. La mémoire est en RAM (reset au restart).</p>
+
+<div class="row">
+  <input id="user_id" placeholder="user_id (ex: email ou username)" />
+  <button onclick="newChat()">New chat</button>
+</div>
+
+<div id="chat"></div>
+
+<div style="margin-top: 12px;">
+  <textarea id="msg" placeholder="Tape ton message..."></textarea>
+  <div class="row">
+    <button onclick="send()">Send</button>
+  </div>
+</div>
+
+<script>
+  const chatEl = document.getElementById('chat');
+  const userIdEl = document.getElementById('user_id');
+  const msgEl = document.getElementById('msg');
+
+  function append(role, text) {
+    const div = document.createElement('div');
+    div.className = 'msg';
+    const who = document.createElement('div');
+    who.className = role === 'user' ? 'user' : 'assistant';
+    who.textContent = role === 'user' ? 'You' : 'Bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble ' + (role === 'user' ? 'b-user' : 'b-assistant');
+    bubble.textContent = text;
+    div.appendChild(who);
+    div.appendChild(bubble);
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function newChat() {
+    chatEl.innerHTML = '';
+    msgEl.value = '';
+    append('assistant', 'Nouvelle conversation. Envoie un message.');
+  }
+
+  async function send() {
+    const user_id = (userIdEl.value || '').trim();
+    const message = (msgEl.value || '').trim();
+    if (!user_id) return alert('Please set user_id');
+    if (!message) return;
+
+    append('user', message);
+    msgEl.value = '';
+
+    const form = new FormData();
+    form.append('user_id', user_id);
+    form.append('message', message);
+
+    try {
+      const res = await fetch('/chat-api', { method: 'POST', body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      append('assistant', data.answer || '(no answer)');
+    } catch (e) {
+      append('assistant', 'ERROR: ' + e.message);
+    }
+  }
+
+  newChat();
+</script>
+
+</body>
+</html>
+"""
+
+
+# =========================
+# Existing bot below (unchanged)
+# =========================
+
 sync_in_progress = False
 
 
-# =========================
-# Step 3: Cached index loader
-# =========================
 @lru_cache(maxsize=8)
 def load_folder_indexes(folder: str):
-    """
-    Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them.
-    Cache must be cleared after upload or sync.
-    Returns: List[(chunks: List[str], index: faiss.Index)]
-    """
     results = []
     paths = glob.glob(f"{folder}/*.json")
 
@@ -251,9 +490,6 @@ def clear_index_cache():
         print("Failed to clear index cache:", e)
 
 
-# =========================
-# Upload
-# =========================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
@@ -278,7 +514,6 @@ async def upload_file(file: UploadFile = File(...)):
         index.add(np.array(vectors).astype("float32"))
         faiss.write_index(index, str(subfolder / f"{document_name}.index"))
 
-        # New doc added => clear cache so /ask can see it
         clear_index_cache()
 
         return {"message": f"Document '{document_name}' uploaded and processed."}
@@ -287,9 +522,6 @@ async def upload_file(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 
-# =========================
-# Sync now (background)
-# =========================
 @app.post("/sync-now")
 def trigger_sync(background_tasks: BackgroundTasks):
     global sync_in_progress
@@ -310,37 +542,23 @@ def trigger_sync(background_tasks: BackgroundTasks):
     return {"status": "started", "message": "SharePoint sync started in background."}
 
 
-# =========================
-# Ask
-# =========================
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
         access_folders = ["documents/public"]
 
-        # RULE 1 — all @erp-is.com emails can access internal docs
         if user_email and user_email.endswith("@erp-is.com"):
             access_folders.append("documents/internal")
-
-        # RULE 2 — emails added via /admin also have internal access
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
-        print("[DEBUG] ask_question called with:", user_email)
-        print("[DEBUG] access_folders:", access_folders)
-
-        # Embed question
         question_vec = embed_texts([question])[0]
         combined_chunks = []
 
-        # FAISS search across allowed folders
         for folder in access_folders:
             data = load_folder_indexes(folder)
             for chunks, index in data:
-                D, I = index.search(
-                    np.array([question_vec]).astype("float32"),
-                    k=3
-                )
+                D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
                         combined_chunks.append((score, chunks[idx]))
@@ -381,9 +599,6 @@ Answer:"""
         return {"error": str(e)}
 
 
-# =========================
-# Admin pages
-# =========================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
     users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
@@ -406,7 +621,6 @@ def add_internal_user(email: str = Form(...)):
     INTERNAL_USERS[email] = True
     with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
         json.dump(INTERNAL_USERS, f, indent=2)
-
     clear_index_cache()
     return HTMLResponse(f"<p>{email} added as internal user. <a href='/admin'>Back</a></p>")
 
@@ -417,15 +631,11 @@ def remove_internal_user(email: str = Form(...)):
         del INTERNAL_USERS[email]
         with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
             json.dump(INTERNAL_USERS, f, indent=2)
-
         clear_index_cache()
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
 
-# =========================
-# Slack integration
-# =========================
 def post_to_slack(response_url: str, text: str):
     try:
         requests.post(
@@ -438,9 +648,7 @@ def post_to_slack(response_url: str, text: str):
 
 
 def process_slack_question(question: str, response_url: str):
-    user_email = "default@erp-is.com"  # internal identity for Slack
-    print("[DEBUG][SLACK] BG processing question:", question, "from", user_email)
-
+    user_email = "default@erp-is.com"
     try:
         answer = ask_question(question=question, user_email=user_email)
         text = answer.get("answer") or answer.get("error") or "No answer from backend."
@@ -457,21 +665,14 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     question = form.get("text") or ""
     response_url = form.get("response_url")
 
-    print("[DEBUG][SLACK] incoming text:", question)
-    print("[DEBUG][SLACK] response_url:", response_url)
-
     if response_url:
         background_tasks.add_task(process_slack_question, question, response_url)
 
     return {"response_type": "ephemeral", "text": "Got it, I’m generating an answer…"}
 
 
-# =========================
-# Startup: sync SharePoint (kept)
-# =========================
 @app.on_event("startup")
 async def startup_event():
-    # Start sync after the app boots (background)
     asyncio.create_task(startup_sync())
 
 
