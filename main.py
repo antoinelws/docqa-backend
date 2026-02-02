@@ -367,10 +367,12 @@ def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5
     return out
 
 
-
 @app.post("/chat-api")
 async def chat_api(user_id: str = Form(...), message: str = Form(...)):
     try:
+        import openai
+        import numpy as np
+
         user_id = (user_id or "").strip()
         message = (message or "").strip()
 
@@ -380,48 +382,53 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
         # -------------------------
-        # 1) Decide doc access scope (same logic as /ask)
+        # 1) Access folders (same logic as /ask)
         # -------------------------
         access_folders = ["documents/public"]
-        if user_id.endswith("@erp-is.com"):
-            access_folders.append("documents/internal")
-        elif INTERNAL_USERS.get(user_id):
+        if user_id.endswith("@erp-is.com") or INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
         # -------------------------
-        # 2) Retrieve relevant doc chunks (RAG)
+        # 2) Retrieve doc excerpts (RAG) like /ask
         # -------------------------
         qvecs = embed_texts([message])
         if not qvecs:
-            return JSONResponse({"error": "Invalid message for embedding"}, status_code=400)
-        qvec = qvecs[0]
+            return JSONResponse({"error": "No valid content to embed."}, status_code=400)
 
-        combined = []
+        question_vec = qvecs[0]
+        combined_chunks = []
+
         for folder in access_folders:
-            data = load_folder_indexes(folder)  # cached
+            data = load_folder_indexes(folder)
             for chunks, index in data:
-                D, I = index.search(np.array([qvec]).astype("float32"), k=4)
+                D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
-                        combined.append((float(score), chunks[idx]))
+                        combined_chunks.append((float(score), chunks[idx]))
 
-        combined.sort(key=lambda x: x[0])
-        top_chunks = [c for _, c in combined[:6]]
-        docs_text = "\n".join(top_chunks).strip() if top_chunks else ""
+        combined_chunks.sort(key=lambda x: x[0])
+        top_chunks = [c for _, c in combined_chunks[:6]]  # 6 = un peu plus riche que /ask
+
+        docs_block = ""
+        if top_chunks:
+            docs_block = "Documentation excerpts:\n" + "\n---\n".join(top_chunks)
 
         # -------------------------
-        # 3) Update user conversation state
+        # 3) Conversation memory (keep your current behavior)
         # -------------------------
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
+
         _summarize_if_needed(user_id)
 
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
         # -------------------------
-        # 4) Build model messages with doc-first rule
+        # 4) Build prompt: doc-first + fallback explicitly
         # -------------------------
+        openai.api_key = OPENAI_API_KEY
+
         system_rules = (
             "You are the ShipERP assistant.\n"
             "You must answer FIRST using the documentation excerpts provided below.\n"
@@ -432,51 +439,45 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
             "Do not mix documentation-based information and general knowledge in the same sentence."
         )
 
-        messages_for_model = [{"role": "system", "content": system_rules}]
+        messages_payload = [
+            {"role": "system", "content": system_rules},
+        ]
 
         if summary:
-            messages_for_model.append(
+            messages_payload.append(
                 {"role": "system", "content": f"Conversation memory (summary):\n{summary}"}
             )
 
-        if docs_text:
-            messages_for_model.append(
-                {"role": "system", "content": "Documentation excerpts:\n\n" + docs_text}
-            )
-        else:
-            messages_for_model.append(
-                {"role": "system", "content": "Documentation excerpts:\n\n(none found for this question)"}
-            )
+        # Keep continuity
+        messages_payload.extend(recent)
 
-        # Add recent conversation turns
-        messages_for_model.extend(recent)
+        # Inject docs as the LAST context before answering
+        # (important: makes retrieval “fresh” for the model)
+        if docs_block:
+            messages_payload.append({"role": "system", "content": docs_block})
 
         # -------------------------
         # 5) Call model
         # -------------------------
-        import openai
-        openai.api_key = OPENAI_API_KEY
-
         resp = openai.ChatCompletion.create(
-            model=CHAT_MODEL,   # ex: "gpt-4" ou "gpt-4o-mini"
-            messages=messages_for_model,
-            temperature=0.4,
+            model=CHAT_MODEL,
+            messages=messages_payload,
+            temperature=0.3,
         )
 
         answer = (resp.choices[0].message.content or "").strip()
 
-        # Store assistant answer in memory
+        # Save assistant answer in memory
         state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
 
         # Safety cap
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": answer, "user_id": user_id}
+        return {"answer": answer, "user_id": user_id, "docs_used": bool(top_chunks)}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
