@@ -370,12 +370,6 @@ def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5
 
 @app.post("/chat-api")
 async def chat_api(user_id: str = Form(...), message: str = Form(...)):
-    """
-    Stateful chat per user_id + RAG (SharePoint indexed docs via FAISS).
-
-    user_id: use an email ideally (controls internal/public access)
-    message: user message
-    """
     try:
         user_id = (user_id or "").strip()
         message = (message or "").strip()
@@ -385,84 +379,104 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # ---- Access control (same idea as /ask) ----
+        # -------------------------
+        # 1) Decide doc access scope (same logic as /ask)
+        # -------------------------
         access_folders = ["documents/public"]
-        if user_id.endswith("@erp-is.com") or INTERNAL_USERS.get(user_id):
+        if user_id.endswith("@erp-is.com"):
+            access_folders.append("documents/internal")
+        elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
-        # ---- Append user message to chat state ----
+        # -------------------------
+        # 2) Retrieve relevant doc chunks (RAG)
+        # -------------------------
+        qvecs = embed_texts([message])
+        if not qvecs:
+            return JSONResponse({"error": "Invalid message for embedding"}, status_code=400)
+        qvec = qvecs[0]
+
+        combined = []
+        for folder in access_folders:
+            data = load_folder_indexes(folder)  # cached
+            for chunks, index in data:
+                D, I = index.search(np.array([qvec]).astype("float32"), k=4)
+                for score, idx in zip(D[0], I[0]):
+                    if 0 <= idx < len(chunks):
+                        combined.append((float(score), chunks[idx]))
+
+        combined.sort(key=lambda x: x[0])
+        top_chunks = [c for _, c in combined[:6]]
+        docs_text = "\n".join(top_chunks).strip() if top_chunks else ""
+
+        # -------------------------
+        # 3) Update user conversation state
+        # -------------------------
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
-
-        # ---- Summarize older turns if needed ----
         _summarize_if_needed(user_id)
 
-        # ---- Build context: summary + recent turns ----
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # ---- RAG: retrieve relevant doc chunks for this turn ----
-        doc_chunks = retrieve_chunks(
-            question=message,
-            access_folders=access_folders,
-            k_per_doc=5,
-            max_total=10,
+        # -------------------------
+        # 4) Build model messages with doc-first rule
+        # -------------------------
+        system_rules = (
+            "You are the ShipERP assistant.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a concise general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence."
         )
 
-        # ---- Compose messages for the model ----
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the ShipERP assistant.\n"
-                    "Maintain continuity across the conversation.\n"
-                    "When documentation excerpts are provided, use them as the primary source of truth.\n"
-                    "If the docs do not contain the answer, say so explicitly and then answer from general knowledge."
-                ),
-            },
-        ]
+        messages_for_model = [{"role": "system", "content": system_rules}]
 
         if summary:
-            messages.append(
+            messages_for_model.append(
                 {"role": "system", "content": f"Conversation memory (summary):\n{summary}"}
             )
 
-        if doc_chunks:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Company documentation excerpts (use these when relevant):\n\n"
-                        + "\n\n".join(doc_chunks)
-                    ),
-                }
+        if docs_text:
+            messages_for_model.append(
+                {"role": "system", "content": "Documentation excerpts:\n\n" + docs_text}
+            )
+        else:
+            messages_for_model.append(
+                {"role": "system", "content": "Documentation excerpts:\n\n(none found for this question)"}
             )
 
-        messages.extend(recent)
+        # Add recent conversation turns
+        messages_for_model.extend(recent)
 
-        # ---- Call OpenAI chat model ----
+        # -------------------------
+        # 5) Call model
+        # -------------------------
         import openai
         openai.api_key = OPENAI_API_KEY
 
         resp = openai.ChatCompletion.create(
-            model=CHAT_MODEL,
-            messages=messages,
+            model=CHAT_MODEL,   # ex: "gpt-4" ou "gpt-4o-mini"
+            messages=messages_for_model,
             temperature=0.4,
         )
 
         answer = (resp.choices[0].message.content or "").strip()
 
-        # ---- Append assistant answer ----
+        # Store assistant answer in memory
         state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
 
-        # Safety: prevent unbounded growth
+        # Safety cap
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": answer, "user_id": user_id, "sources_used": bool(doc_chunks)}
+        return {"answer": answer, "user_id": user_id}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
