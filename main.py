@@ -651,56 +651,74 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(run_and_release)
     return {"status": "started", "message": "SharePoint sync started in background."}
-
-
 @app.post("/ask")
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
+        # --- Access control ---
         access_folders = ["documents/public"]
-
         if user_email and user_email.endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
-        question_vec = embed_texts([question])[0]
-        combined_chunks = []
+        # --- Embed question ---
+        qvecs = embed_texts([question])
+        if not qvecs:
+            return {"answer": "Invalid or empty question."}
+        question_vec = qvecs[0]
 
+        # --- Retrieve top chunks ---
+        combined_chunks = []
         for folder in access_folders:
             data = load_folder_indexes(folder)
             for chunks, index in data:
                 D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
                 for score, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
-                        combined_chunks.append((score, chunks[idx]))
+                        combined_chunks.append((float(score), chunks[idx]))
 
         combined_chunks.sort(key=lambda x: x[0])
         top_chunks = [chunk for _, chunk in combined_chunks[:5]]
 
         if not top_chunks:
-            return {"answer": "No relevant content found."}
+            # No docs found -> general knowledge allowed but clearly labeled
+            top_chunks_text = ""
+        else:
+            top_chunks_text = "\n".join(top_chunks)
 
-        prompt = f"""You are a helpful assistant answering questions using company documentation.
+        # --- Build messages (single consistent method) ---
+        system_rules = (
+            "You are the ShipERP assistant.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a concise general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence."
+        )
 
-Based on the content provided below, answer the user's question clearly and concisely.
-If the answer is spread across multiple points, synthesize the key info into a complete explanation.
-Do not mention documents or chunking. Just answer as if you know the topic.
+        messages = [{"role": "system", "content": system_rules}]
 
-Document Content:
-{chr(10).join(top_chunks)}
+        if top_chunks_text.strip():
+            messages.append({
+                "role": "system",
+                "content": "Documentation excerpts:\n\n" + top_chunks_text
+            })
+        else:
+            messages.append({
+                "role": "system",
+                "content": "Documentation excerpts:\n\n(none found for this question)"
+            })
 
-Question: {question}
-Answer:"""
+        messages.append({"role": "user", "content": question})
 
+        # --- Call model ---
         import openai
         openai.api_key = OPENAI_API_KEY
 
         response = openai.ChatCompletion.create(
             model="gpt-4",
-            messages=[
-                {"role":"system","content":"You are a helpful assistant for ShipERP. Use the provided company documentation excerpts as the main source of truth. If docs don’t cover it, say so and answer from general knowledge clearly labeled."},
-                {"role": "user", "content": prompt}
-            ],
+            messages=messages,
             temperature=0.3
         )
 
