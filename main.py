@@ -103,20 +103,44 @@ def chunk_text(text: str, max_chars: int = 1000):
     return chunks
 
 
-def embed_texts(texts, batch_size: int = 64):
+def embed_texts(texts, batch_size: int = 32):
     """
-    Embeds in batches to reduce peak RAM and request size.
-    Note: This uses the legacy openai-python interface (openai.Embedding.create).
+    Safe embedding:
+    - filtre les entrées invalides
+    - tronque les textes trop longs
+    - ne fait PAS planter le sync
     """
     import openai
     openai.api_key = OPENAI_API_KEY
 
-    all_vectors = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        response = openai.Embedding.create(input=batch, model=EMBEDDING_MODEL)
-        all_vectors.extend([d["embedding"] for d in response["data"]])
-    return all_vectors
+    clean_texts = []
+    for t in texts:
+        if not t or not isinstance(t, str):
+            continue
+        t = t.strip()
+        if len(t) < 10:
+            continue
+        if len(t) > 6000:
+            t = t[:6000]
+        clean_texts.append(t)
+
+    if not clean_texts:
+        return []
+
+    vectors = []
+    for i in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[i:i + batch_size]
+        try:
+            resp = openai.Embedding.create(
+                model=EMBEDDING_MODEL,
+                input=batch
+            )
+            vectors.extend([d["embedding"] for d in resp["data"]])
+        except Exception as e:
+            print("[EMBEDDING ERROR] batch skipped:", str(e))
+
+    return vectors
+
 
 
 def log_sync_activity(filename, user_name, user_email):
@@ -186,6 +210,12 @@ def sync_sharepoint():
             continue
 
         vectors = embed_texts(chunks)
+
+       
+        if not vectors:
+            print(f"[WARN] No embeddings generated for {name}, skipping file")
+            continue
+
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
