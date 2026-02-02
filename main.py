@@ -334,9 +334,48 @@ Update the summary. Keep it factual and concise. Preserve decisions, constraints
 
     state["messages"] = keep
 
+def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5, max_total: int = 12):
+    """
+    RAG retrieval from FAISS indexes.
+    Returns a list of best chunks across all accessible folders.
+    """
+    qvecs = embed_texts([question])
+    if not qvecs:
+        return []
+    qvec = qvecs[0]
+
+    scored = []
+    for folder in access_folders:
+        data = load_folder_indexes(folder)
+        for chunks, index in data:
+            D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
+            for dist, idx in zip(D[0], I[0]):
+                if 0 <= idx < len(chunks):
+                    scored.append((float(dist), chunks[idx]))
+
+    scored.sort(key=lambda x: x[0])  # smaller distance = better
+    # dedupe while keeping best
+    seen = set()
+    out = []
+    for _, c in scored:
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+        if len(out) >= max_total:
+            break
+    return out
+
+
 
 @app.post("/chat-api")
 async def chat_api(user_id: str = Form(...), message: str = Form(...)):
+    """
+    Stateful chat per user_id + RAG (SharePoint indexed docs via FAISS).
+
+    user_id: use an email ideally (controls internal/public access)
+    message: user message
+    """
     try:
         user_id = (user_id or "").strip()
         message = (message or "").strip()
@@ -346,22 +385,62 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        state = _get_user_state(user_id)
+        # ---- Access control (same idea as /ask) ----
+        access_folders = ["documents/public"]
+        if user_id.endswith("@erp-is.com") or INTERNAL_USERS.get(user_id):
+            access_folders.append("documents/internal")
 
+        # ---- Append user message to chat state ----
+        state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
+        # ---- Summarize older turns if needed ----
         _summarize_if_needed(user_id)
 
+        # ---- Build context: summary + recent turns ----
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
+        # ---- RAG: retrieve relevant doc chunks for this turn ----
+        doc_chunks = retrieve_chunks(
+            question=message,
+            access_folders=access_folders,
+            k_per_doc=5,
+            max_total=10,
+        )
+
+        # ---- Compose messages for the model ----
         messages = [
-            {"role": "system", "content": "You are a helpful assistant. Maintain continuity across the conversation."},
+            {
+                "role": "system",
+                "content": (
+                    "You are the ShipERP assistant.\n"
+                    "Maintain continuity across the conversation.\n"
+                    "When documentation excerpts are provided, use them as the primary source of truth.\n"
+                    "If the docs do not contain the answer, say so explicitly and then answer from general knowledge."
+                ),
+            },
         ]
+
         if summary:
-            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
+            messages.append(
+                {"role": "system", "content": f"Conversation memory (summary):\n{summary}"}
+            )
+
+        if doc_chunks:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Company documentation excerpts (use these when relevant):\n\n"
+                        + "\n\n".join(doc_chunks)
+                    ),
+                }
+            )
+
         messages.extend(recent)
 
+        # ---- Call OpenAI chat model ----
         import openai
         openai.api_key = OPENAI_API_KEY
 
@@ -373,12 +452,14 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
 
         answer = (resp.choices[0].message.content or "").strip()
 
+        # ---- Append assistant answer ----
         state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
 
+        # Safety: prevent unbounded growth
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": answer, "user_id": user_id}
+        return {"answer": answer, "user_id": user_id, "sources_used": bool(doc_chunks)}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -617,7 +698,7 @@ Answer:"""
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You answer questions based on documents."},
+                {"role":"system","content":"You are a helpful assistant for ShipERP. Use the provided company documentation excerpts as the main source of truth. If docs don’t cover it, say so and answer from general knowledge clearly labeled."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3
