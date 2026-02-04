@@ -66,9 +66,7 @@ def authenticate() -> str:
 # Text extraction + chunking
 # =========================
 def extract_text(filename: str, content: bytes) -> str:
-    """
-    Extracts text from pdf/docx/txt.
-    """
+    """Extracts text from pdf/docx/txt."""
     ext = filename.lower().split(".")[-1]
 
     if ext == "pdf":
@@ -95,9 +93,7 @@ def extract_text(filename: str, content: bytes) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
-    """
-    Simple chunker for docs (not Slack export).
-    """
+    """Simple chunker for docs (not Slack export)."""
     text = (text or "").strip()
     if not text:
         return []
@@ -130,6 +126,7 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     - never crashes sync: skips failing batches
     """
     import openai
+
     openai.api_key = OPENAI_API_KEY
 
     clean_texts: List[str] = []
@@ -162,10 +159,7 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
 # =========================
 @lru_cache(maxsize=8)
 def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
-    """
-    Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them.
-    Returns: List[(chunks: List[str], index: faiss.Index)]
-    """
+    """Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them."""
     results: List[Tuple[List[str], faiss.Index]] = []
     paths = glob.glob(f"{folder}/*.json")
 
@@ -184,9 +178,36 @@ def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
     return results
 
 
+@lru_cache(maxsize=8)
+def load_folder_indexes_with_names(folder: str) -> List[Tuple[str, List[str], faiss.Index]]:
+    """
+    Same as load_folder_indexes, but includes doc name (basename without extension).
+    Returns: List[(doc_name, chunks, index)]
+
+    NOTE: cached; call clear_index_cache() after upload/sync.
+    """
+    results: List[Tuple[str, List[str], faiss.Index]] = []
+    paths = glob.glob(f"{folder}/*.json")
+
+    for json_path in paths:
+        base = os.path.splitext(os.path.basename(json_path))[0]
+        index_path = os.path.join(folder, f"{base}.index")
+        if not os.path.exists(index_path):
+            continue
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+
+        index = faiss.read_index(index_path)
+        results.append((base, chunks, index))
+
+    return results
+
+
 def clear_index_cache():
     try:
         load_folder_indexes.cache_clear()
+        load_folder_indexes_with_names.cache_clear()
         print("Index cache cleared.")
     except Exception as e:
         print("Failed to clear index cache:", e)
@@ -374,6 +395,7 @@ def trigger_sync(background_tasks: BackgroundTasks):
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
         import openai
+
         openai.api_key = OPENAI_API_KEY
 
         # Access control
@@ -418,17 +440,13 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
             "You must answer FIRST using the documentation excerpts provided below.\n"
             "If the documentation contains relevant information, base your answer strictly on it.\n\n"
             "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
             "Only then, provide a concise general-knowledge answer.\n"
             "Do not mix documentation-based information and general knowledge in the same sentence."
         )
 
         docs_block = "\n---\n".join(top_chunks) if top_chunks else "(none found for this question)"
-        user_prompt = f"""Documentation excerpts:
-{docs_block}
-
-Question: {question}
-"""
+        user_prompt = f"""Documentation excerpts:\n{docs_block}\n\nQuestion: {question}\n"""
 
         resp = openai.ChatCompletion.create(
             model="gpt-4",
@@ -448,7 +466,7 @@ Question: {question}
 # =========================
 # Conversation (per-user) + RAG
 # =========================
-CHAT_MODEL = "gpt-4"          # or "gpt-4o-mini" if you switch later
+CHAT_MODEL = "gpt-4"          # or "gpt-4o-mini" later
 CHAT_MAX_TURNS = 12
 CHAT_SUMMARY_TRIGGER = 18
 CHAT_CONTEXT_CHAR_BUDGET = 14000
@@ -462,9 +480,7 @@ def _now_iso() -> str:
 
 
 def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
-    """
-    Keep newest messages within a rough char budget.
-    """
+    """Keep newest messages within a rough char budget."""
     out = []
     total = 0
     for m in reversed(messages):
@@ -486,9 +502,7 @@ def _get_user_state(user_id: str) -> Dict[str, Any]:
 
 
 def _summarize_if_needed(user_id: str):
-    """
-    Summarize older turns into 'summary' if too many messages.
-    """
+    """Summarize older turns into 'summary' if too many messages."""
     state = _get_user_state(user_id)
     msgs = state["messages"]
 
@@ -504,6 +518,7 @@ def _summarize_if_needed(user_id: str):
         return
 
     import openai
+
     openai.api_key = OPENAI_API_KEY
 
     summary_prompt = f"""You are maintaining a running summary of a chat.
@@ -537,7 +552,7 @@ def _trim_chars(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     if len(s) <= max_chars:
         return s
-    return s[:max_chars] + "…"
+    return s[:max_chars].rstrip() + "…"
 
 
 def _trim_list_to_char_budget(items: List[str], budget_chars: int) -> List[str]:
@@ -547,43 +562,46 @@ def _trim_list_to_char_budget(items: List[str], budget_chars: int) -> List[str]:
         it = (it or "").strip()
         if not it:
             continue
-        if total + len(it) + 2 > budget_chars:
+        add = len(it) + 5
+        if out and (total + add) > budget_chars:
             break
         out.append(it)
-        total += len(it) + 2
+        total += add
     return out
 
 
-def retrieve_chunks(question: str, access_folders: List[str], k_per_doc: int = 6, max_total: int = 12) -> List[str]:
-    """
-    RAG retrieval from FAISS indexes.
-    Returns a list of best chunks across all accessible folders.
-    """
+def retrieve_chunks_with_sources(
+    question: str,
+    access_folders: List[str],
+    k_per_doc: int = 6,
+    max_total: int = 12,
+):
+    """RAG retrieval from FAISS indexes; returns list of (chunk, doc_name)."""
     qvecs = embed_texts([question])
     if not qvecs:
         return []
     qvec = qvecs[0]
 
-    scored: List[Tuple[float, str]] = []
+    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc)
+
     for folder in access_folders:
-        for chunks, index in load_folder_indexes(folder):
+        for doc_name, chunks, index in load_folder_indexes_with_names(folder):
             D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
             for dist, idx in zip(D[0], I[0]):
                 if 0 <= idx < len(chunks):
-                    scored.append((float(dist), chunks[idx]))
+                    scored.append((float(dist), str(chunks[idx]), doc_name))
 
-    if not scored:
-        return []
+    scored.sort(key=lambda x: x[0])
 
-    scored.sort(key=lambda x: x[0])  # smaller distance = better
+    # dedupe by chunk (keep best)
     seen = set()
-    out: List[str] = []
-    for _, c in scored:
+    out: List[Tuple[str, str]] = []
+    for _, c, doc in scored:
         c = (c or "").strip()
         if not c or c in seen:
             continue
         seen.add(c)
-        out.append(c)
+        out.append((c, doc))
         if len(out) >= max_total:
             break
     return out
@@ -593,7 +611,7 @@ def retrieve_chunks(question: str, access_folders: List[str], k_per_doc: int = 6
 async def chat_api(
     user_id: str = Form(...),
     message: str = Form(...),
-    debug: bool = Form(False),  # optional: /chat-api accepts debug=true
+    debug: bool = Form(False),
 ):
     """
     Stateful chat per user_id + docs RAG.
@@ -602,12 +620,16 @@ async def chat_api(
     - Answer using docs excerpts if they contain answer.
     - Otherwise: say exact fallback sentence then general knowledge.
 
-    Adds "Sources" in the response (doc file basenames used for excerpts).
-    Adds optional debug logs in Render when debug=true.
+    Sources policy (FIXED):
+    - We append Sources SERVER-SIDE using doc names only, deduped.
+    - We show Sources ONLY when the answer is docs-based.
+    - If the assistant used fallback general knowledge, we show NO doc sources.
+
+    Debug:
+    - If debug=true, prints retrieval details to Render logs.
     """
     try:
         import openai
-        import numpy as np
 
         user_id = (user_id or "").strip()
         message = (message or "").strip()
@@ -617,34 +639,13 @@ async def chat_api(
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # ---- tiny local helpers (avoid missing globals) ----
-        def _trim_chars_local(s: str, n: int) -> str:
-            s = (s or "").strip()
-            if len(s) <= n:
-                return s
-            return s[:n].rstrip() + "…"
-
-        def _trim_list_to_char_budget_local(items: list[str], budget_chars: int) -> list[str]:
-            out, total = [], 0
-            for it in items:
-                it = (it or "").strip()
-                if not it:
-                    continue
-                add = len(it) + 5
-                if out and (total + add) > budget_chars:
-                    break
-                out.append(it)
-                total += add
-            return out
-
-        # ---- Access control (same as /ask) ----
+        # Access control (same as /ask)
         access_folders = ["documents/public"]
         if user_id.lower().endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
-        # ---- Conversation state ----
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
@@ -653,101 +654,37 @@ async def chat_api(
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # ---- RAG retrieval WITH sources (doc name) ----
-        # We do it inline so we can attach doc basenames without changing your global retrieve_chunks().
-        qvecs = embed_texts([message])
-        if not qvecs:
-            return JSONResponse({"error": "Invalid question (not embeddable)."}, status_code=400)
-        qvec = qvecs[0]
+        # RAG excerpts for this turn (with sources)
+        retrieved = retrieve_chunks_with_sources(message, access_folders, k_per_doc=6, max_total=12)
+        chunks = [_trim_chars(c, 1200) for (c, _) in retrieved]
+        chunks = _trim_list_to_char_budget(chunks, budget_chars=9000)
 
-        scored: list[tuple[float, str, str]] = []  # (dist, chunk, doc_name)
+        # Keep sources aligned with trimmed chunks
+        used = retrieved[: len(chunks)]
 
-        for folder in access_folders:
-            # We need doc names => scan json files to infer base names.
-            json_paths = glob.glob(f"{folder}/*.json")
-            for json_path in json_paths:
-                base = os.path.splitext(os.path.basename(json_path))[0]
-                index_path = os.path.join(folder, f"{base}.index")
-                if not os.path.exists(index_path):
-                    continue
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
 
-                try:
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        chunks_list = json.load(f)
-                    index = faiss.read_index(index_path)
-                except Exception as e:
-                    if debug:
-                        print("[CHAT][DEBUG] Failed loading doc:", json_path, "err:", e)
-                    continue
-
-                # search
-                D, I = index.search(np.array([qvec]).astype("float32"), k=6)
-                for dist, idx in zip(D[0], I[0]):
-                    if 0 <= idx < len(chunks_list):
-                        c = chunks_list[idx]
-                        if c:
-                            scored.append((float(dist), str(c), base))
-
-        scored.sort(key=lambda x: x[0])  # smaller = better
-
-        # dedupe chunks while keeping best + keep sources
-        seen_chunks = set()
-        chosen_chunks: list[str] = []
-        chosen_sources: list[str] = []  # parallel to chosen_chunks
-
-        for dist, c, doc_name in scored:
-            c = (c or "").strip()
-            if not c:
-                continue
-            if c in seen_chunks:
-                continue
-            seen_chunks.add(c)
-
-            chosen_chunks.append(_trim_chars_local(c, 1200))
-            chosen_sources.append(doc_name)
-
-            if len(chosen_chunks) >= 12:
-                break
-
-        chosen_chunks = _trim_list_to_char_budget_local(chosen_chunks, budget_chars=9000)
-
-        # align sources length if trimming cut off (safe)
-        chosen_sources = chosen_sources[: len(chosen_chunks)]
-
-        # ---- Debug logs (Render) ----
         if debug:
             print("[CHAT][DEBUG] user_id:", user_id)
-            print("[CHAT][DEBUG] message:", message)
             print("[CHAT][DEBUG] access_folders:", access_folders)
-            print("[CHAT][DEBUG] retrieved_chunks:", len(chosen_chunks))
-            for i, (c, src) in enumerate(zip(chosen_chunks[:8], chosen_sources[:8]), start=1):
-                preview = c.replace("\n", " ")[:260]
-                print(f"[CHAT][DEBUG] chunk#{i} src={src} :: {preview}")
+            print("[CHAT][DEBUG] retrieved:", len(used))
+            for i, (c, src) in enumerate(used[:8], start=1):
+                prev = (c or "").replace("\n", " ")[:220]
+                print(f"[CHAT][DEBUG] #{i} src={src} :: {prev}")
 
-        # ---- Build docs block + sources list ----
-        if chosen_chunks:
-            docs_block = "\n---\n".join(chosen_chunks)
-            # unique sources in display order
-            uniq_sources = []
-            seen = set()
-            for s in chosen_sources:
-                if s and s not in seen:
-                    seen.add(s)
-                    uniq_sources.append(s)
-        else:
-            docs_block = "(none found for this question)"
-            uniq_sources = []
+        fallback_sentence = "The documentation does not mention this, but here is what I know from general knowledge:"
 
+        # IMPORTANT: do NOT ask the model to print sources. We'll append them ourselves.
         system_rules = (
             "You are the ShipERP assistant.\n"
             "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n"
+            "You may paraphrase to make the answer clearer, but do not invent facts.\n\n"
             "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            f'\"{fallback_sentence}\"\n\n'
             "Only then, provide a general-knowledge answer.\n"
             "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Be practical and sufficiently detailed to be useful.\n"
-            "At the end of your answer, include a 'Sources:' section listing the document names used."
+            "Do NOT include a Sources section."  # backend will do it
         )
 
         messages = [{"role": "system", "content": system_rules}]
@@ -762,16 +699,24 @@ async def chat_api(
             model=CHAT_MODEL,
             messages=messages,
             temperature=0.3,
-            max_tokens=850,  # helps get less "short" answers
+            max_tokens=900,  # encourage less "short" answers
         )
 
         answer = (resp.choices[0].message.content or "").strip()
 
-        # If the model forgot to add sources, we append them (so users always get them).
-        # (We still keep the instruction in system_rules for nicer formatting.)
-        sources_block = "Sources: " + (", ".join(uniq_sources) if uniq_sources else "(none)")
-        if "sources:" not in answer.lower():
-            answer = answer.rstrip() + "\n\n" + sources_block
+        # Determine if assistant used fallback
+        used_fallback = answer.lower().startswith(fallback_sentence.lower())
+
+        # Append sources ONLY if docs-based and we actually retrieved docs
+        uniq_sources: List[str] = []
+        if (not used_fallback) and used:
+            seen = set()
+            for _, src in used:
+                if src and src not in seen:
+                    seen.add(src)
+                    uniq_sources.append(src)
+            if uniq_sources:
+                answer = answer.rstrip() + "\n\nSources: " + ", ".join(uniq_sources)
 
         state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
 
@@ -782,7 +727,6 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
