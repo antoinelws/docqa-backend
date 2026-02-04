@@ -590,14 +590,25 @@ def retrieve_chunks(question: str, access_folders: List[str], k_per_doc: int = 6
 
 
 @app.post("/chat-api")
-async def chat_api(user_id: str = Form(...), message: str = Form(...)):
+async def chat_api(
+    user_id: str = Form(...),
+    message: str = Form(...),
+    debug: bool = Form(False),  # optional: /chat-api accepts debug=true
+):
     """
     Stateful chat per user_id + docs RAG.
+
     Docs-first rule:
     - Answer using docs excerpts if they contain answer.
     - Otherwise: say exact fallback sentence then general knowledge.
+
+    Adds "Sources" in the response (doc file basenames used for excerpts).
+    Adds optional debug logs in Render when debug=true.
     """
     try:
+        import openai
+        import numpy as np
+
         user_id = (user_id or "").strip()
         message = (message or "").strip()
 
@@ -606,13 +617,34 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # Access control (same as /ask)
+        # ---- tiny local helpers (avoid missing globals) ----
+        def _trim_chars_local(s: str, n: int) -> str:
+            s = (s or "").strip()
+            if len(s) <= n:
+                return s
+            return s[:n].rstrip() + "…"
+
+        def _trim_list_to_char_budget_local(items: list[str], budget_chars: int) -> list[str]:
+            out, total = [], 0
+            for it in items:
+                it = (it or "").strip()
+                if not it:
+                    continue
+                add = len(it) + 5
+                if out and (total + add) > budget_chars:
+                    break
+                out.append(it)
+                total += add
+            return out
+
+        # ---- Access control (same as /ask) ----
         access_folders = ["documents/public"]
         if user_id.lower().endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
+        # ---- Conversation state ----
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
@@ -621,12 +653,90 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # RAG excerpts for this turn
-        chunks = retrieve_chunks(message, access_folders, k_per_doc=6, max_total=12)
-        chunks = [_trim_chars(c, 1200) for c in chunks]
-        chunks = _trim_list_to_char_budget(chunks, budget_chars=9000)
+        # ---- RAG retrieval WITH sources (doc name) ----
+        # We do it inline so we can attach doc basenames without changing your global retrieve_chunks().
+        qvecs = embed_texts([message])
+        if not qvecs:
+            return JSONResponse({"error": "Invalid question (not embeddable)."}, status_code=400)
+        qvec = qvecs[0]
 
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        scored: list[tuple[float, str, str]] = []  # (dist, chunk, doc_name)
+
+        for folder in access_folders:
+            # We need doc names => scan json files to infer base names.
+            json_paths = glob.glob(f"{folder}/*.json")
+            for json_path in json_paths:
+                base = os.path.splitext(os.path.basename(json_path))[0]
+                index_path = os.path.join(folder, f"{base}.index")
+                if not os.path.exists(index_path):
+                    continue
+
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        chunks_list = json.load(f)
+                    index = faiss.read_index(index_path)
+                except Exception as e:
+                    if debug:
+                        print("[CHAT][DEBUG] Failed loading doc:", json_path, "err:", e)
+                    continue
+
+                # search
+                D, I = index.search(np.array([qvec]).astype("float32"), k=6)
+                for dist, idx in zip(D[0], I[0]):
+                    if 0 <= idx < len(chunks_list):
+                        c = chunks_list[idx]
+                        if c:
+                            scored.append((float(dist), str(c), base))
+
+        scored.sort(key=lambda x: x[0])  # smaller = better
+
+        # dedupe chunks while keeping best + keep sources
+        seen_chunks = set()
+        chosen_chunks: list[str] = []
+        chosen_sources: list[str] = []  # parallel to chosen_chunks
+
+        for dist, c, doc_name in scored:
+            c = (c or "").strip()
+            if not c:
+                continue
+            if c in seen_chunks:
+                continue
+            seen_chunks.add(c)
+
+            chosen_chunks.append(_trim_chars_local(c, 1200))
+            chosen_sources.append(doc_name)
+
+            if len(chosen_chunks) >= 12:
+                break
+
+        chosen_chunks = _trim_list_to_char_budget_local(chosen_chunks, budget_chars=9000)
+
+        # align sources length if trimming cut off (safe)
+        chosen_sources = chosen_sources[: len(chosen_chunks)]
+
+        # ---- Debug logs (Render) ----
+        if debug:
+            print("[CHAT][DEBUG] user_id:", user_id)
+            print("[CHAT][DEBUG] message:", message)
+            print("[CHAT][DEBUG] access_folders:", access_folders)
+            print("[CHAT][DEBUG] retrieved_chunks:", len(chosen_chunks))
+            for i, (c, src) in enumerate(zip(chosen_chunks[:8], chosen_sources[:8]), start=1):
+                preview = c.replace("\n", " ")[:260]
+                print(f"[CHAT][DEBUG] chunk#{i} src={src} :: {preview}")
+
+        # ---- Build docs block + sources list ----
+        if chosen_chunks:
+            docs_block = "\n---\n".join(chosen_chunks)
+            # unique sources in display order
+            uniq_sources = []
+            seen = set()
+            for s in chosen_sources:
+                if s and s not in seen:
+                    seen.add(s)
+                    uniq_sources.append(s)
+        else:
+            docs_block = "(none found for this question)"
+            uniq_sources = []
 
         system_rules = (
             "You are the ShipERP assistant.\n"
@@ -634,9 +744,10 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
             "If the documentation contains relevant information, base your answer strictly on it.\n\n"
             "If the documentation does NOT contain the answer, say explicitly:\n"
             "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-            "Only then, provide a concise general-knowledge answer.\n"
+            "Only then, provide a general-knowledge answer.\n"
             "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Keep answers short and practical."
+            "Be practical and sufficiently detailed to be useful.\n"
+            "At the end of your answer, include a 'Sources:' section listing the document names used."
         )
 
         messages = [{"role": "system", "content": system_rules}]
@@ -646,25 +757,32 @@ async def chat_api(user_id: str = Form(...), message: str = Form(...)):
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
-        import openai
         openai.api_key = OPENAI_API_KEY
-
         resp = openai.ChatCompletion.create(
             model=CHAT_MODEL,
             messages=messages,
             temperature=0.3,
+            max_tokens=850,  # helps get less "short" answers
         )
 
         answer = (resp.choices[0].message.content or "").strip()
+
+        # If the model forgot to add sources, we append them (so users always get them).
+        # (We still keep the instruction in system_rules for nicer formatting.)
+        sources_block = "Sources: " + (", ".join(uniq_sources) if uniq_sources else "(none)")
+        if "sources:" not in answer.lower():
+            answer = answer.rstrip() + "\n\n" + sources_block
+
         state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
 
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": answer, "user_id": user_id}
+        return {"answer": answer, "user_id": user_id, "sources": uniq_sources}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
