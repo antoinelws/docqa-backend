@@ -616,20 +616,15 @@ async def chat_api(
     """
     Stateful chat per user_id + docs RAG.
 
-    Docs-first rule:
-    - Answer using docs excerpts if they contain answer.
-    - Otherwise: say exact fallback sentence then general knowledge.
-
-    Sources policy (FIXED):
-    - We append Sources SERVER-SIDE using doc names only, deduped.
-    - We show Sources ONLY when the answer is docs-based.
-    - If the assistant used fallback general knowledge, we show NO doc sources.
-
-    Debug:
-    - If debug=true, prints retrieval details to Render logs.
+    Fix:
+    - If the user asks about the chat history (memory/meta questions),
+      we answer directly from CHAT_STORE (no docs, no sources).
+    - Otherwise: docs-first + fallback + sources (doc file names only).
     """
     try:
         import openai
+        import numpy as np
+        import re
 
         user_id = (user_id or "").strip()
         message = (message or "").strip()
@@ -639,58 +634,187 @@ async def chat_api(
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # Access control (same as /ask)
+        # ---- Access control (same as /ask) ----
         access_folders = ["documents/public"]
         if user_id.lower().endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
+        # ---- Conversation state ----
         state = _get_user_state(user_id)
+
+        # Append user message first (so the store is always complete)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
+        # Summarize older turns if needed
         _summarize_if_needed(user_id)
 
+        # -----------------------------
+        # 1) CHAT MEMORY / META QUERIES
+        # -----------------------------
+        msg_lc = message.lower().strip()
+
+        def is_chat_memory_question(s: str) -> bool:
+            # English + FR common phrasing
+            patterns = [
+                r"\bfirst question\b",
+                r"\bmy first question\b",
+                r"\bwhat was i asking\b",
+                r"\bwhat did i ask\b",
+                r"\bearlier\b.*\b(chat|conversation)\b",
+                r"\bin this chat\b",
+                r"\bin this conversation\b",
+                r"\bwhat did you say\b",
+                r"\bwhat did i say\b",
+                r"\bwhat have we discussed\b",
+                r"\brappelle\b.*\b(premi|première)\b.*\bquestion\b",
+                r"\bc'était quoi\b.*\bma\b.*\b(premi|première)\b.*\bquestion\b",
+                r"\bdans ce chat\b",
+                r"\bdans cette conversation\b",
+            ]
+            return any(re.search(p, s) for p in patterns)
+
+        if is_chat_memory_question(msg_lc):
+            # Find the first user question in THIS chat (excluding empty and excluding the current question itself)
+            user_msgs = [
+                m.get("content", "").strip()
+                for m in state.get("messages", [])
+                if m.get("role") == "user" and (m.get("content") or "").strip()
+            ]
+
+            # Remove the current question (last one) if it matches
+            if user_msgs and user_msgs[-1].strip().lower() == message.strip().lower():
+                user_msgs = user_msgs[:-1]
+
+            if user_msgs:
+                first_q = user_msgs[0]
+                answer = f'Your first question in this chat was: "{first_q}"'
+            else:
+                answer = "I don't have any earlier question stored in this chat yet."
+
+            # store assistant reply so the conversation continues consistently
+            state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
+            return {"answer": answer, "user_id": user_id, "sources": []}
+
+        # ----------------------------------
+        # 2) NORMAL FLOW: DOCS RAG + MEMORY
+        # ----------------------------------
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # RAG excerpts for this turn (with sources)
-        retrieved = retrieve_chunks_with_sources(message, access_folders, k_per_doc=6, max_total=12)
-        chunks = [_trim_chars(c, 1200) for (c, _) in retrieved]
-        chunks = _trim_list_to_char_budget(chunks, budget_chars=9000)
+        # ---- small local helpers ----
+        def _trim_chars_local(s: str, n: int) -> str:
+            s = (s or "").strip()
+            if len(s) <= n:
+                return s
+            return s[:n].rstrip() + "…"
 
-        # Keep sources aligned with trimmed chunks
-        used = retrieved[: len(chunks)]
+        def _trim_list_to_char_budget_local(items: list[str], budget_chars: int) -> list[str]:
+            out, total = [], 0
+            for it in items:
+                it = (it or "").strip()
+                if not it:
+                    continue
+                add = len(it) + 5
+                if out and (total + add) > budget_chars:
+                    break
+                out.append(it)
+                total += add
+            return out
 
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        # ---- Embed question ----
+        qvecs = embed_texts([message])
+        if not qvecs:
+            return JSONResponse({"error": "Invalid question (not embeddable)."}, status_code=400)
+        qvec = qvecs[0]
+
+        # ---- Retrieve chunks WITH sources (doc base name) ----
+        scored: list[tuple[float, str, str]] = []  # (dist, chunk, doc_name)
+
+        for folder in access_folders:
+            json_paths = glob.glob(f"{folder}/*.json")
+            for json_path in json_paths:
+                base = os.path.splitext(os.path.basename(json_path))[0]
+                index_path = os.path.join(folder, f"{base}.index")
+                if not os.path.exists(index_path):
+                    continue
+
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        chunks_list = json.load(f)
+                    index = faiss.read_index(index_path)
+                except Exception as e:
+                    if debug:
+                        print("[CHAT][DEBUG] Failed loading doc:", json_path, "err:", e)
+                    continue
+
+                D, I = index.search(np.array([qvec]).astype("float32"), k=6)
+                for dist, idx in zip(D[0], I[0]):
+                    if 0 <= idx < len(chunks_list):
+                        c = chunks_list[idx]
+                        if c:
+                            scored.append((float(dist), str(c), base))
+
+        scored.sort(key=lambda x: x[0])
+
+        # Deduplicate chunks; keep sources aligned
+        seen_chunks = set()
+        chosen_chunks: list[str] = []
+        chosen_sources: list[str] = []
+
+        for dist, c, doc_name in scored:
+            c = (c or "").strip()
+            if not c:
+                continue
+            if c in seen_chunks:
+                continue
+            seen_chunks.add(c)
+
+            chosen_chunks.append(_trim_chars_local(c, 1200))
+            chosen_sources.append(doc_name)
+
+            if len(chosen_chunks) >= 12:
+                break
+
+        chosen_chunks = _trim_list_to_char_budget_local(chosen_chunks, budget_chars=9000)
+        chosen_sources = chosen_sources[: len(chosen_chunks)]
+
+        # Unique file names only, preserve order
+        uniq_sources: list[str] = []
+        seen_src = set()
+        for s in chosen_sources:
+            if s and s not in seen_src:
+                seen_src.add(s)
+                uniq_sources.append(s)
 
         if debug:
             print("[CHAT][DEBUG] user_id:", user_id)
+            print("[CHAT][DEBUG] message:", message)
             print("[CHAT][DEBUG] access_folders:", access_folders)
-            print("[CHAT][DEBUG] retrieved:", len(used))
-            for i, (c, src) in enumerate(used[:8], start=1):
-                prev = (c or "").replace("\n", " ")[:220]
-                print(f"[CHAT][DEBUG] #{i} src={src} :: {prev}")
+            print("[CHAT][DEBUG] retrieved_chunks:", len(chosen_chunks))
+            print("[CHAT][DEBUG] sources:", uniq_sources)
 
-        fallback_sentence = "The documentation does not mention this, but here is what I know from general knowledge:"
+        docs_block = "\n---\n".join(chosen_chunks) if chosen_chunks else "(none found for this question)"
 
-        # IMPORTANT: do NOT ask the model to print sources. We'll append them ourselves.
+        # IMPORTANT:
+        # Do NOT let the model invent "Sources:".
+        # We'll append sources ourselves ONLY if answer is docs-based.
         system_rules = (
             "You are the ShipERP assistant.\n"
             "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n"
-            "You may paraphrase to make the answer clearer, but do not invent facts.\n\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
             "If the documentation does NOT contain the answer, say explicitly:\n"
-            f'\"{fallback_sentence}\"\n\n'
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
             "Only then, provide a general-knowledge answer.\n"
             "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Do NOT include a Sources section."  # backend will do it
+            "Be practical and sufficiently detailed to be useful.\n"
+            "Do NOT include any 'Sources' section in your answer."
         )
 
         messages = [{"role": "system", "content": system_rules}]
         if summary:
             messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
-
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
@@ -699,35 +823,33 @@ async def chat_api(
             model=CHAT_MODEL,
             messages=messages,
             temperature=0.3,
-            max_tokens=900,  # encourage less "short" answers
+            max_tokens=900,
         )
 
         answer = (resp.choices[0].message.content or "").strip()
 
-        # Determine if assistant used fallback
-        used_fallback = answer.lower().startswith(fallback_sentence.lower())
+        # Append sources ONLY if docs-based.
+        # (If the model used the fallback sentence => no sources, as requested.)
+        fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
+        if answer.lower().startswith(fallback_marker):
+            final_answer = answer  # no sources in fallback mode
+            out_sources = []
+        else:
+            out_sources = uniq_sources
+            if out_sources:
+                final_answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+            else:
+                final_answer = answer  # no sources if we had no chunks
 
-        # Append sources ONLY if docs-based and we actually retrieved docs
-        uniq_sources: List[str] = []
-        if (not used_fallback) and used:
-            seen = set()
-            for _, src in used:
-                if src and src not in seen:
-                    seen.add(src)
-                    uniq_sources.append(src)
-            if uniq_sources:
-                answer = answer.rstrip() + "\n\nSources: " + ", ".join(uniq_sources)
-
-        state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
+        state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
 
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": answer, "user_id": user_id, "sources": uniq_sources}
+        return {"answer": final_answer, "user_id": user_id, "sources": out_sources}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 @app.get("/chat-ui", response_class=HTMLResponse)
 def chat_ui():
