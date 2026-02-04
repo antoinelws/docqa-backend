@@ -395,6 +395,7 @@ def trigger_sync(background_tasks: BackgroundTasks):
 def ask_question(question: str = Form(...), user_email: str = Form(...)):
     try:
         import openai
+        import numpy as np
 
         openai.api_key = OPENAI_API_KEY
 
@@ -405,6 +406,10 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
+        question = (question or "").strip()
+        if not question:
+            return {"answer": "Invalid or empty question."}
+
         # Embed
         qvecs = embed_texts([question])
         if not qvecs:
@@ -412,56 +417,61 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         qvec = qvecs[0]
 
         # Retrieve
-        scored: List[Tuple[float, str]] = []
+        scored = []
         for folder in access_folders:
             for chunks, index in load_folder_indexes(folder):
                 D, I = index.search(np.array([qvec]).astype("float32"), k=8)
                 for dist, idx in zip(D[0], I[0]):
                     if 0 <= idx < len(chunks):
-                        scored.append((float(dist), chunks[idx]))
+                        scored.append((float(dist), (chunks[idx] or "").strip()))
 
-        if not scored:
-            top_chunks = []
-        else:
-            scored.sort(key=lambda x: x[0])
-            seen = set()
-            top_chunks = []
-            for _, c in scored:
-                c = (c or "").strip()
-                if not c or c in seen:
-                    continue
-                seen.add(c)
-                top_chunks.append(c)
-                if len(top_chunks) >= 12:
-                    break
+        scored.sort(key=lambda x: x[0])
+
+        # Dedupe + keep top
+        top_chunks = []
+        seen = set()
+        for _, c in scored:
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            top_chunks.append(c)
+            if len(top_chunks) >= 12:
+                break
+
+        docs_block = "\n---\n".join(top_chunks) if top_chunks else ""
 
         system_rules = (
             "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
-            "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence."
+            "Answer the user.\n\n"
+            "Rule:\n"
+            "- If the documentation excerpts contain relevant information, answer ONLY from them.\n"
+            "- If they do NOT contain the answer, say exactly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n"
+            "Then answer from general knowledge.\n"
         )
 
-        docs_block = "\n---\n".join(top_chunks) if top_chunks else "(none found for this question)"
-        user_prompt = f"""Documentation excerpts:\n{docs_block}\n\nQuestion: {question}\n"""
+        messages = [
+            {"role": "system", "content": system_rules},
+        ]
 
-        resp = openai.ChatCompletion.create(
+        if docs_block:
+            messages.append({"role": "system", "content": "Documentation excerpts:\n" + docs_block})
+        else:
+            messages.append({"role": "system", "content": "Documentation excerpts:\n(none found for this question)"})
+
+        messages.append({"role": "user", "content": question})
+
+        response = openai.ChatCompletion.create(
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_rules},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             temperature=0.2,
+            max_tokens=700,
         )
 
-        return {"answer": resp.choices[0].message.content}
+        return {"answer": response.choices[0].message.content}
 
     except Exception as e:
         return {"error": str(e)}
-
 
 # =========================
 # Conversation (per-user) + RAG
