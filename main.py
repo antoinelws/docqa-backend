@@ -6,7 +6,7 @@ import datetime
 import tempfile
 from pathlib import Path
 from functools import lru_cache
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 import requests
 import pdfplumber
@@ -22,33 +22,35 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sow_estimator import router as estimator_router
 
 
-# === Load secrets from environment ===
+# =========================
+# Config
+# =========================
 load_dotenv()
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# === SharePoint Info ===
 DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
 FOLDER_PATH = "AI"
 
-# === Backend processing path ===
 DESTINATION_FOLDER = "documents"
 os.makedirs(DESTINATION_FOLDER, exist_ok=True)
-
 HISTORY_LOG = os.path.join(DESTINATION_FOLDER, "sync_log.csv")
 
-# === Constants for embedding ===
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 
-# === Authentication ===
 SCOPES = ["https://graph.microsoft.com/.default"]
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
+INTERNAL_USER_FILE = "internal_users.json"
 
-def authenticate():
+
+# =========================
+# Auth / SharePoint
+# =========================
+def authenticate() -> str:
     app = ConfidentialClientApplication(
         CLIENT_ID,
         authority=AUTHORITY,
@@ -60,6 +62,9 @@ def authenticate():
     return result["access_token"]
 
 
+# =========================
+# Text extraction + chunking
+# =========================
 def extract_text(filename: str, content: bytes) -> str:
     """
     Extracts text from pdf/docx/txt.
@@ -73,14 +78,14 @@ def extract_text(filename: str, content: bytes) -> str:
             with pdfplumber.open(tmp.name) as pdf:
                 return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-    elif ext == "docx":
+    if ext == "docx":
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(content)
             tmp.flush()
             doc = docx.Document(tmp.name)
             return "\n".join(p.text for p in doc.paragraphs)
 
-    elif ext == "txt":
+    if ext == "txt":
         try:
             return content.decode("utf-8", errors="ignore")
         except Exception:
@@ -89,31 +94,45 @@ def extract_text(filename: str, content: bytes) -> str:
     return ""
 
 
-def chunk_text(text: str, max_chars: int = 1000):
+def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
+    """
+    Simple chunker for docs (not Slack export).
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
     sentences = text.split(". ")
-    chunks, chunk = [], ""
-    for sentence in sentences:
-        if len(chunk) + len(sentence) < max_chars:
-            chunk += sentence + ". "
+    chunks, buf = [], ""
+    for s in sentences:
+        s = (s or "").strip()
+        if not s:
+            continue
+        candidate = (buf + s + ". ").strip()
+        if len(candidate) <= max_chars:
+            buf = candidate + " "
         else:
-            chunks.append(chunk.strip())
-            chunk = sentence + ". "
-    if chunk:
-        chunks.append(chunk.strip())
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = (s + ". ").strip()
+    if buf.strip():
+        chunks.append(buf.strip())
     return chunks
 
 
-def embed_texts(texts, batch_size: int = 32):
+# =========================
+# Embeddings (safe)
+# =========================
+def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     """
     Safe embedding:
-    - filtre les entrées invalides
-    - tronque les textes trop longs
-    - ne fait PAS planter le sync
+    - filters invalid entries
+    - truncates long text
+    - never crashes sync: skips failing batches
     """
     import openai
     openai.api_key = OPENAI_API_KEY
 
-    clean_texts = []
+    clean_texts: List[str] = []
     for t in texts:
         if not t or not isinstance(t, str):
             continue
@@ -127,26 +146,59 @@ def embed_texts(texts, batch_size: int = 32):
     if not clean_texts:
         return []
 
-    vectors = []
+    vectors: List[List[float]] = []
     for i in range(0, len(clean_texts), batch_size):
         batch = clean_texts[i:i + batch_size]
         try:
-            resp = openai.Embedding.create(
-                model=EMBEDDING_MODEL,
-                input=batch
-            )
+            resp = openai.Embedding.create(model=EMBEDDING_MODEL, input=batch)
             vectors.extend([d["embedding"] for d in resp["data"]])
         except Exception as e:
             print("[EMBEDDING ERROR] batch skipped:", str(e))
-
     return vectors
 
 
+# =========================
+# Index cache
+# =========================
+@lru_cache(maxsize=8)
+def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
+    """
+    Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them.
+    Returns: List[(chunks: List[str], index: faiss.Index)]
+    """
+    results: List[Tuple[List[str], faiss.Index]] = []
+    paths = glob.glob(f"{folder}/*.json")
 
-def log_sync_activity(filename, user_name, user_email):
-    timestamp = datetime.datetime.utcnow().isoformat()
+    for json_path in paths:
+        base = os.path.splitext(os.path.basename(json_path))[0]
+        index_path = os.path.join(folder, f"{base}.index")
+        if not os.path.exists(index_path):
+            continue
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+
+        index = faiss.read_index(index_path)
+        results.append((chunks, index))
+
+    return results
+
+
+def clear_index_cache():
+    try:
+        load_folder_indexes.cache_clear()
+        print("Index cache cleared.")
+    except Exception as e:
+        print("Failed to clear index cache:", e)
+
+
+# =========================
+# SharePoint sync
+# =========================
+def log_sync_activity(filename: str, user_name: str, user_email: str):
+    ts = datetime.datetime.utcnow().isoformat()
     with open(HISTORY_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{timestamp},{filename},{user_name},{user_email}\n")
+        f.write(f"{ts},{filename},{user_name},{user_email}\n")
 
 
 def sync_sharepoint():
@@ -156,7 +208,7 @@ def sync_sharepoint():
     access_token = authenticate()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    def list_files(sub_path):
+    def list_files(sub_path: str):
         full_path = f"{FOLDER_PATH}/{sub_path}".replace(" ", "%20")
         url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{full_path}:/children"
         resp = requests.get(url, headers=headers, timeout=60)
@@ -165,7 +217,6 @@ def sync_sharepoint():
 
     internal_files = list_files(internal_subfolder)
     public_files = list_files(public_subfolder)
-
     all_files = [(f, "internal") for f in internal_files] + [(f, "public") for f in public_files]
 
     for file, access_level in all_files:
@@ -198,6 +249,7 @@ def sync_sharepoint():
         file_data = requests.get(download_url, timeout=120)
         file_data.raise_for_status()
 
+        # keep original file locally (optional)
         dest_path = subfolder / name
         with open(dest_path, "wb") as f:
             f.write(file_data.content)
@@ -210,12 +262,9 @@ def sync_sharepoint():
             continue
 
         vectors = embed_texts(chunks)
-
-       
         if not vectors:
             print(f"[WARN] No embeddings generated for {name}, skipping file")
             continue
-
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
@@ -232,8 +281,9 @@ def sync_sharepoint():
     print("Sync complete. Files processed and saved to ./documents/")
 
 
-# Load internal user list
-INTERNAL_USER_FILE = "internal_users.json"
+# =========================
+# Internal users
+# =========================
 if os.path.exists(INTERNAL_USER_FILE):
     with open(INTERNAL_USER_FILE, "r", encoding="utf-8") as f:
         INTERNAL_USERS = json.load(f)
@@ -241,6 +291,9 @@ else:
     INTERNAL_USERS = {}
 
 
+# =========================
+# FastAPI
+# =========================
 app = FastAPI()
 app.include_router(estimator_router)
 
@@ -252,24 +305,166 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+sync_in_progress = False
+
 
 # =========================
-# Conversation (per-user) - isolated feature
+# Upload (public)
 # =========================
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        filename = file.filename
+        document_name = os.path.splitext(filename)[0]
 
-CHAT_MODEL = "gpt-4"           # ou gpt-4o-mini
+        content = await file.read()
+        text = extract_text(filename, content)
+        chunks = chunk_text(text)
+        if not chunks:
+            return {"error": "No text extracted from uploaded file."}
+
+        vectors = embed_texts(chunks)
+        if not vectors:
+            return {"error": "No valid text to embed in this document."}
+
+        subfolder = Path(DESTINATION_FOLDER) / "public"
+        subfolder.mkdir(parents=True, exist_ok=True)
+
+        with open(subfolder / f"{document_name}.json", "w", encoding="utf-8") as f:
+            json.dump(chunks, f)
+
+        index = faiss.IndexFlatL2(VECTOR_DIM)
+        index.add(np.array(vectors).astype("float32"))
+        faiss.write_index(index, str(subfolder / f"{document_name}.index"))
+
+        clear_index_cache()
+        return {"message": f"Document '{document_name}' uploaded and processed."}
+    except Exception as e:
+        print("Upload failed:", str(e))
+        return {"error": str(e)}
+
+
+# =========================
+# Sync now (background)
+# =========================
+@app.post("/sync-now")
+def trigger_sync(background_tasks: BackgroundTasks):
+    global sync_in_progress
+    if sync_in_progress:
+        return {"status": "busy", "message": "Sync already in progress."}
+
+    sync_in_progress = True
+
+    def run_and_release():
+        global sync_in_progress
+        try:
+            sync_sharepoint()
+        finally:
+            sync_in_progress = False
+            clear_index_cache()
+
+    background_tasks.add_task(run_and_release)
+    return {"status": "started", "message": "SharePoint sync started in background."}
+
+
+# =========================
+# One-shot QA (/ask) - docs-first + fallback
+# =========================
+@app.post("/ask")
+def ask_question(question: str = Form(...), user_email: str = Form(...)):
+    try:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+
+        # Access control
+        access_folders = ["documents/public"]
+        if user_email and user_email.endswith("@erp-is.com"):
+            access_folders.append("documents/internal")
+        elif INTERNAL_USERS.get(user_email):
+            access_folders.append("documents/internal")
+
+        # Embed
+        qvecs = embed_texts([question])
+        if not qvecs:
+            return {"answer": "Invalid or empty question."}
+        qvec = qvecs[0]
+
+        # Retrieve
+        scored: List[Tuple[float, str]] = []
+        for folder in access_folders:
+            for chunks, index in load_folder_indexes(folder):
+                D, I = index.search(np.array([qvec]).astype("float32"), k=8)
+                for dist, idx in zip(D[0], I[0]):
+                    if 0 <= idx < len(chunks):
+                        scored.append((float(dist), chunks[idx]))
+
+        if not scored:
+            top_chunks = []
+        else:
+            scored.sort(key=lambda x: x[0])
+            seen = set()
+            top_chunks = []
+            for _, c in scored:
+                c = (c or "").strip()
+                if not c or c in seen:
+                    continue
+                seen.add(c)
+                top_chunks.append(c)
+                if len(top_chunks) >= 12:
+                    break
+
+        system_rules = (
+            "You are the ShipERP assistant.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a concise general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence."
+        )
+
+        docs_block = "\n---\n".join(top_chunks) if top_chunks else "(none found for this question)"
+        user_prompt = f"""Documentation excerpts:
+{docs_block}
+
+Question: {question}
+"""
+
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_rules},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+
+        return {"answer": resp.choices[0].message.content}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =========================
+# Conversation (per-user) + RAG
+# =========================
+CHAT_MODEL = "gpt-4"          # or "gpt-4o-mini" if you switch later
 CHAT_MAX_TURNS = 12
 CHAT_SUMMARY_TRIGGER = 18
 CHAT_CONTEXT_CHAR_BUDGET = 14000
 
+# In-memory store (resets on restart)
 CHAT_STORE: Dict[str, Dict[str, Any]] = {}
 
 
-def _now_iso():
+def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 
 def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
+    """
+    Keep newest messages within a rough char budget.
+    """
     out = []
     total = 0
     for m in reversed(messages):
@@ -291,6 +486,9 @@ def _get_user_state(user_id: str) -> Dict[str, Any]:
 
 
 def _summarize_if_needed(user_id: str):
+    """
+    Summarize older turns into 'summary' if too many messages.
+    """
     state = _get_user_state(user_id)
     msgs = state["messages"]
 
@@ -299,8 +497,8 @@ def _summarize_if_needed(user_id: str):
 
     keep = msgs[-CHAT_MAX_TURNS:]
     old = msgs[:-CHAT_MAX_TURNS]
-
     old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+
     if not old_text.strip():
         state["messages"] = keep
         return
@@ -334,7 +532,29 @@ Update the summary. Keep it factual and concise. Preserve decisions, constraints
 
     state["messages"] = keep
 
-def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5, max_total: int = 12):
+
+def _trim_chars(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "…"
+
+
+def _trim_list_to_char_budget(items: List[str], budget_chars: int) -> List[str]:
+    out = []
+    total = 0
+    for it in items:
+        it = (it or "").strip()
+        if not it:
+            continue
+        if total + len(it) + 2 > budget_chars:
+            break
+        out.append(it)
+        total += len(it) + 2
+    return out
+
+
+def retrieve_chunks(question: str, access_folders: List[str], k_per_doc: int = 6, max_total: int = 12) -> List[str]:
     """
     RAG retrieval from FAISS indexes.
     Returns a list of best chunks across all accessible folders.
@@ -344,21 +564,23 @@ def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5
         return []
     qvec = qvecs[0]
 
-    scored = []
+    scored: List[Tuple[float, str]] = []
     for folder in access_folders:
-        data = load_folder_indexes(folder)
-        for chunks, index in data:
+        for chunks, index in load_folder_indexes(folder):
             D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
             for dist, idx in zip(D[0], I[0]):
                 if 0 <= idx < len(chunks):
                     scored.append((float(dist), chunks[idx]))
 
+    if not scored:
+        return []
+
     scored.sort(key=lambda x: x[0])  # smaller distance = better
-    # dedupe while keeping best
     seen = set()
-    out = []
+    out: List[str] = []
     for _, c in scored:
-        if c in seen:
+        c = (c or "").strip()
+        if not c or c in seen:
             continue
         seen.add(c)
         out.append(c)
@@ -366,85 +588,83 @@ def retrieve_chunks(question: str, access_folders: list[str], k_per_doc: int = 5
             break
     return out
 
-@app.post("/ask")
-def ask_question(question: str = Form(...), user_email: str = Form(...)):
-    try:
-        import openai
-        import numpy as np
 
+@app.post("/chat-api")
+async def chat_api(user_id: str = Form(...), message: str = Form(...)):
+    """
+    Stateful chat per user_id + docs RAG.
+    Docs-first rule:
+    - Answer using docs excerpts if they contain answer.
+    - Otherwise: say exact fallback sentence then general knowledge.
+    """
+    try:
+        user_id = (user_id or "").strip()
+        message = (message or "").strip()
+
+        if not user_id:
+            return JSONResponse({"error": "Missing user_id"}, status_code=400)
+        if not message:
+            return JSONResponse({"error": "Empty message"}, status_code=400)
+
+        # Access control (same as /ask)
         access_folders = ["documents/public"]
-        if user_email and (user_email.endswith("@erp-is.com") or INTERNAL_USERS.get(user_email)):
+        if user_id.lower().endswith("@erp-is.com"):
+            access_folders.append("documents/internal")
+        elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
-        # 1) Embed question
-        qvecs = embed_texts([question])
-        if not qvecs:
-            return {"answer": "Invalid question (empty or not embeddable)."}
-        question_vec = qvecs[0]
+        state = _get_user_state(user_id)
+        state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
-        # 2) Retrieve more candidates
-        combined = []
-        for folder in access_folders:
-            data = load_folder_indexes(folder)
-            for chunks, index in data:
-                D, I = index.search(np.array([question_vec]).astype("float32"), k=8)
-                for score, idx in zip(D[0], I[0]):
-                    if 0 <= idx < len(chunks):
-                        combined.append((float(score), chunks[idx]))
+        _summarize_if_needed(user_id)
 
-        if not combined:
-            return {"answer": "No relevant content found."}
+        summary = (state["summary"] or "").strip()
+        recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # 3) Sort + dedupe
-        combined.sort(key=lambda x: x[0])
-        seen = set()
-        top_chunks = []
-        for _, c in combined:
-            c = (c or "").strip()
-            if not c or c in seen:
-                continue
-            seen.add(c)
-            top_chunks.append(c)
-            if len(top_chunks) >= 12:
-                break
+        # RAG excerpts for this turn
+        chunks = retrieve_chunks(message, access_folders, k_per_doc=6, max_total=12)
+        chunks = [_trim_chars(c, 1200) for c in chunks]
+        chunks = _trim_list_to_char_budget(chunks, budget_chars=9000)
 
-        if not top_chunks:
-            return {"answer": "No relevant content found."}
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
 
-        # 4) Doc-first system rules (exact behavior you asked)
         system_rules = (
             "You are the ShipERP assistant.\n"
             "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer on it.\n"
-            "You may paraphrase/reformulate to make the answer clearer, but do not invent facts.\n\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
             "If the documentation does NOT contain the answer, say explicitly:\n"
             "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
             "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence."
+            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+            "Keep answers short and practical."
         )
 
-        docs_block = "\n---\n".join(top_chunks)
+        messages = [{"role": "system", "content": system_rules}]
+        if summary:
+            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
 
-        prompt = f"""Documentation excerpts:
-{docs_block}
+        messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
+        messages.extend(recent)
 
-Question: {question}
-"""
-
+        import openai
         openai.api_key = OPENAI_API_KEY
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_rules},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
+
+        resp = openai.ChatCompletion.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.3,
         )
 
-        return {"answer": response.choices[0].message.content}
+        answer = (resp.choices[0].message.content or "").strip()
+        state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
+
+        if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
+            state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
+
+        return {"answer": answer, "user_id": user_id}
 
     except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -549,167 +769,8 @@ def chat_ui():
 
 
 # =========================
-# Existing bot below (unchanged)
+# Admin pages
 # =========================
-
-sync_in_progress = False
-
-
-@lru_cache(maxsize=8)
-def load_folder_indexes(folder: str):
-    results = []
-    paths = glob.glob(f"{folder}/*.json")
-
-    for json_path in paths:
-        base = os.path.splitext(os.path.basename(json_path))[0]
-        index_path = os.path.join(folder, f"{base}.index")
-        if not os.path.exists(index_path):
-            continue
-
-        with open(json_path, "r", encoding="utf-8") as f:
-            chunks = json.load(f)
-
-        index = faiss.read_index(index_path)
-        results.append((chunks, index))
-
-    return results
-
-
-def clear_index_cache():
-    try:
-        load_folder_indexes.cache_clear()
-        print("Index cache cleared.")
-    except Exception as e:
-        print("Failed to clear index cache:", e)
-
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        filename = file.filename
-        document_name = os.path.splitext(filename)[0]
-
-        content = await file.read()
-        text = extract_text(filename, content)
-        chunks = chunk_text(text)
-        if not chunks:
-            return {"error": "No text extracted from uploaded file."}
-
-        vectors = embed_texts(chunks)
-
-        subfolder = Path(DESTINATION_FOLDER) / "public"
-        subfolder.mkdir(parents=True, exist_ok=True)
-
-        with open(subfolder / f"{document_name}.json", "w", encoding="utf-8") as f:
-            json.dump(chunks, f)
-
-        index = faiss.IndexFlatL2(VECTOR_DIM)
-        index.add(np.array(vectors).astype("float32"))
-        faiss.write_index(index, str(subfolder / f"{document_name}.index"))
-
-        clear_index_cache()
-
-        return {"message": f"Document '{document_name}' uploaded and processed."}
-    except Exception as e:
-        print("Upload failed:", str(e))
-        return {"error": str(e)}
-
-
-@app.post("/sync-now")
-def trigger_sync(background_tasks: BackgroundTasks):
-    global sync_in_progress
-    if sync_in_progress:
-        return {"status": "busy", "message": "Sync already in progress."}
-
-    sync_in_progress = True
-
-    def run_and_release():
-        global sync_in_progress
-        try:
-            sync_sharepoint()
-        finally:
-            sync_in_progress = False
-            clear_index_cache()
-
-    background_tasks.add_task(run_and_release)
-    return {"status": "started", "message": "SharePoint sync started in background."}
-@app.post("/ask")
-def ask_question(question: str = Form(...), user_email: str = Form(...)):
-    try:
-        # --- Access control ---
-        access_folders = ["documents/public"]
-        if user_email and user_email.endswith("@erp-is.com"):
-            access_folders.append("documents/internal")
-        elif INTERNAL_USERS.get(user_email):
-            access_folders.append("documents/internal")
-
-        # --- Embed question ---
-        qvecs = embed_texts([question])
-        if not qvecs:
-            return {"answer": "Invalid or empty question."}
-        question_vec = qvecs[0]
-
-        # --- Retrieve top chunks ---
-        combined_chunks = []
-        for folder in access_folders:
-            data = load_folder_indexes(folder)
-            for chunks, index in data:
-                D, I = index.search(np.array([question_vec]).astype("float32"), k=3)
-                for score, idx in zip(D[0], I[0]):
-                    if 0 <= idx < len(chunks):
-                        combined_chunks.append((float(score), chunks[idx]))
-
-        combined_chunks.sort(key=lambda x: x[0])
-        top_chunks = [chunk for _, chunk in combined_chunks[:5]]
-
-        if not top_chunks:
-            # No docs found -> general knowledge allowed but clearly labeled
-            top_chunks_text = ""
-        else:
-            top_chunks_text = "\n".join(top_chunks)
-
-        # --- Build messages (single consistent method) ---
-        system_rules = (
-            "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-            "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence."
-        )
-
-        messages = [{"role": "system", "content": system_rules}]
-
-        if top_chunks_text.strip():
-            messages.append({
-                "role": "system",
-                "content": "Documentation excerpts:\n\n" + top_chunks_text
-            })
-        else:
-            messages.append({
-                "role": "system",
-                "content": "Documentation excerpts:\n\n(none found for this question)"
-            })
-
-        messages.append({"role": "user", "content": question})
-
-        # --- Call model ---
-        import openai
-        openai.api_key = OPENAI_API_KEY
-
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=messages,
-            temperature=0.3
-        )
-
-        return {"answer": response.choices[0].message.content}
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
     users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
@@ -747,6 +808,9 @@ def remove_internal_user(email: str = Form(...)):
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
 
+# =========================
+# Slack integration
+# =========================
 def post_to_slack(response_url: str, text: str):
     try:
         requests.post(
@@ -759,6 +823,7 @@ def post_to_slack(response_url: str, text: str):
 
 
 def process_slack_question(question: str, response_url: str):
+    # internal identity for Slack
     user_email = "default@erp-is.com"
     try:
         answer = ask_question(question=question, user_email=user_email)
@@ -773,7 +838,7 @@ def process_slack_question(question: str, response_url: str):
 @app.post("/ask-from-slack")
 async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
-    question = form.get("text") or ""
+    question = (form.get("text") or "").strip()
     response_url = form.get("response_url")
 
     if response_url:
@@ -782,6 +847,9 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     return {"response_type": "ephemeral", "text": "Got it, I’m generating an answer…"}
 
 
+# =========================
+# Startup sync
+# =========================
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(startup_sync())
