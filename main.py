@@ -392,12 +392,17 @@ def trigger_sync(background_tasks: BackgroundTasks):
 # One-shot QA (/ask) - docs-first + fallback
 # =========================
 @app.post("/ask")
-def ask_question(question: str = Form(...), user_email: str = Form(...)):
+def ask_question(
+    question: str = Form(...),
+    user_email: str = Form(...),
+    debug: bool = Form(False),
+):
     try:
         import openai
-        import numpy as np
-
         openai.api_key = OPENAI_API_KEY
+
+        question = (question or "").strip()
+        user_email = (user_email or "").strip()
 
         # Access control
         access_folders = ["documents/public"]
@@ -406,69 +411,48 @@ def ask_question(question: str = Form(...), user_email: str = Form(...)):
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
-        question = (question or "").strip()
-        if not question:
-            return {"answer": "Invalid or empty question."}
-
-        # Embed
-        qvecs = embed_texts([question])
-        if not qvecs:
-            return {"answer": "Invalid or empty question."}
-        qvec = qvecs[0]
-
         # Retrieve
-        scored = []
-        for folder in access_folders:
-            for chunks, index in load_folder_indexes(folder):
-                D, I = index.search(np.array([qvec]).astype("float32"), k=8)
-                for dist, idx in zip(D[0], I[0]):
-                    if 0 <= idx < len(chunks):
-                        scored.append((float(dist), (chunks[idx] or "").strip()))
+        chunks, sources = retrieve_chunks_with_sources(
+            question=question,
+            access_folders=access_folders,
+            k_per_doc=8,
+            max_total=12,
+            chunk_max_chars=1200,
+            debug=debug,
+        )
 
-        scored.sort(key=lambda x: x[0])
-
-        # Dedupe + keep top
-        top_chunks = []
-        seen = set()
-        for _, c in scored:
-            if not c or c in seen:
-                continue
-            seen.add(c)
-            top_chunks.append(c)
-            if len(top_chunks) >= 12:
-                break
-
-        docs_block = "\n---\n".join(top_chunks) if top_chunks else ""
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
 
         system_rules = (
             "You are the ShipERP assistant.\n"
-            "Answer the user.\n\n"
-            "Rule:\n"
-            "- If the documentation excerpts contain relevant information, answer ONLY from them.\n"
-            "- If they do NOT contain the answer, say exactly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n"
-            "Then answer from general knowledge.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a concise general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
         )
 
         messages = [
             {"role": "system", "content": system_rules},
+            {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+            {"role": "user", "content": question},
         ]
 
-        if docs_block:
-            messages.append({"role": "system", "content": "Documentation excerpts:\n" + docs_block})
-        else:
-            messages.append({"role": "system", "content": "Documentation excerpts:\n(none found for this question)"})
-
-        messages.append({"role": "user", "content": question})
-
-        response = openai.ChatCompletion.create(
+        resp = openai.ChatCompletion.create(
             model="gpt-4",
             messages=messages,
             temperature=0.2,
             max_tokens=700,
         )
 
-        return {"answer": response.choices[0].message.content}
+        answer = (resp.choices[0].message.content or "").strip()
+
+        # ✅ Sources: only if we actually had docs chunks
+        if chunks and sources:
+            answer = answer.rstrip() + "\n\nSources: " + ", ".join(sources)
+
+        return {"answer": answer, "sources": sources}
 
     except Exception as e:
         return {"error": str(e)}
@@ -585,36 +569,90 @@ def retrieve_chunks_with_sources(
     access_folders: List[str],
     k_per_doc: int = 6,
     max_total: int = 12,
-):
-    """RAG retrieval from FAISS indexes; returns list of (chunk, doc_name)."""
+    chunk_max_chars: int = 1200,
+    debug: bool = False,
+) -> Tuple[List[str], List[str]]:
+    """
+    Returns:
+      chunks: list[str] (deduped best chunks)
+      sources: list[str] unique doc basenames (deduped, in order of first appearance)
+    """
+    question = (question or "").strip()
+    if not question:
+        return [], []
+
     qvecs = embed_texts([question])
     if not qvecs:
-        return []
+        return [], []
     qvec = qvecs[0]
 
-    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc)
+    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
 
     for folder in access_folders:
-        for doc_name, chunks, index in load_folder_indexes_with_names(folder):
+        json_paths = glob.glob(f"{folder}/*.json")
+        for json_path in json_paths:
+            base = os.path.splitext(os.path.basename(json_path))[0]
+            index_path = os.path.join(folder, f"{base}.index")
+            if not os.path.exists(index_path):
+                continue
+
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    chunks_list = json.load(f)
+                index = faiss.read_index(index_path)
+            except Exception as e:
+                if debug:
+                    print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
+                continue
+
             D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
             for dist, idx in zip(D[0], I[0]):
-                if 0 <= idx < len(chunks):
-                    scored.append((float(dist), str(chunks[idx]), doc_name))
+                if 0 <= idx < len(chunks_list):
+                    c = (chunks_list[idx] or "").strip()
+                    if c:
+                        scored.append((float(dist), c, base))
 
-    scored.sort(key=lambda x: x[0])
+    if not scored:
+        return [], []
 
-    # dedupe by chunk (keep best)
-    seen = set()
-    out: List[Tuple[str, str]] = []
-    for _, c, doc in scored:
-        c = (c or "").strip()
-        if not c or c in seen:
+    scored.sort(key=lambda x: x[0])  # smaller = better
+
+    # Dedupe chunks, keep top max_total
+    seen_chunks = set()
+    chunks: List[str] = []
+    sources_ordered: List[str] = []
+
+    for dist, c, doc_base in scored:
+        if c in seen_chunks:
             continue
-        seen.add(c)
-        out.append((c, doc))
-        if len(out) >= max_total:
+        seen_chunks.add(c)
+
+        if len(c) > chunk_max_chars:
+            c = c[:chunk_max_chars].rstrip() + "…"
+
+        chunks.append(c)
+        sources_ordered.append(doc_base)
+
+        if len(chunks) >= max_total:
             break
-    return out
+
+    # Unique sources (deduped in order)
+    uniq_sources: List[str] = []
+    seen_src = set()
+    for s in sources_ordered:
+        if s and s not in seen_src:
+            seen_src.add(s)
+            uniq_sources.append(s)
+
+    if debug:
+        print("[RAG][DEBUG] question:", question)
+        print("[RAG][DEBUG] access_folders:", access_folders)
+        print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
+        for i, c in enumerate(chunks[:6], start=1):
+            print(f"[RAG][DEBUG] chunk#{i}:", c.replace("\n", " ")[:240])
+
+    return chunks, uniq_sources
+
 
 
 @app.post("/chat-api")
@@ -1017,11 +1055,11 @@ def post_to_slack(response_url: str, text: str):
 
 
 def process_slack_question(question: str, response_url: str):
-    # internal identity for Slack
-    user_email = "default@erp-is.com"
+    user_email = "default@erp-is.com"  # internal identity for Slack
+
     try:
-        answer = ask_question(question=question, user_email=user_email)
-        text = answer.get("answer") or answer.get("error") or "No answer from backend."
+        result = ask_question(question=question, user_email=user_email)  # one-shot
+        text = result.get("answer") or result.get("error") or "No answer."
     except Exception as e:
         text = f"Error while processing: {str(e)}"
 
