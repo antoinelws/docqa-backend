@@ -495,6 +495,97 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
 
 # =========================
+# Retrieve (with sources)
+# =========================
+def retrieve_chunks_with_sources(
+    question: str,
+    access_folders: List[str],
+    k_per_doc: int = 6,
+    max_total: int = 12,
+    chunk_max_chars: int = 1200,
+    debug: bool = False,
+) -> Tuple[List[str], List[str]]:
+    """
+    Returns:
+      chunks: list[str] (deduped best chunks)
+      sources: list[str] unique doc basenames (deduped, in order of first appearance)
+    """
+    question = (question or "").strip()
+    if not question:
+        return [], []
+
+    qvecs = embed_texts([question])
+    if not qvecs:
+        return [], []
+    qvec = qvecs[0]
+
+    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
+
+    for folder in access_folders:
+        json_paths = glob.glob(f"{folder}/*.json")
+        for json_path in json_paths:
+            base = os.path.splitext(os.path.basename(json_path))[0]
+            index_path = os.path.join(folder, f"{base}.index")
+            if not os.path.exists(index_path):
+                continue
+
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    chunks_list = json.load(f)
+                index = faiss.read_index(index_path)
+            except Exception as e:
+                if debug:
+                    print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
+                continue
+
+            D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
+            for dist, idx in zip(D[0], I[0]):
+                if 0 <= idx < len(chunks_list):
+                    c = (chunks_list[idx] or "").strip()
+                    if c:
+                        scored.append((float(dist), c, base))
+
+    if not scored:
+        return [], []
+
+    scored.sort(key=lambda x: x[0])  # smaller = better
+
+    seen_chunks = set()
+    chunks: List[str] = []
+    sources_ordered: List[str] = []
+
+    for dist, c, doc_base in scored:
+        if c in seen_chunks:
+            continue
+        seen_chunks.add(c)
+
+        if len(c) > chunk_max_chars:
+            c = c[:chunk_max_chars].rstrip() + "…"
+
+        chunks.append(c)
+        sources_ordered.append(doc_base)
+
+        if len(chunks) >= max_total:
+            break
+
+    uniq_sources: List[str] = []
+    seen_src = set()
+    for s in sources_ordered:
+        if s and s not in seen_src:
+            seen_src.add(s)
+            uniq_sources.append(s)
+
+    if debug:
+        print("[RAG][DEBUG] question:", question)
+        print("[RAG][DEBUG] access_folders:", access_folders)
+        print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
+        for i, c in enumerate(chunks[:6], start=1):
+            print(f"[RAG][DEBUG] chunk#{i}:", c.replace("\n", " ")[:240])
+
+    return chunks, uniq_sources
+
+
+# =========================
 # One-shot QA (/ask) - docs-first + fallback + Option B routing
 # =========================
 @app.post("/ask")
@@ -507,14 +598,12 @@ def ask_question(
         question = (question or "").strip()
         user_email = (user_email or "").strip()
 
-        # Access control
         access_folders = ["documents/public"]
         if user_email and user_email.endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
-        # Retrieve
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
             access_folders=access_folders,
@@ -545,7 +634,6 @@ def ask_question(
             {"role": "user", "content": question},
         ]
 
-        # Option B routing
         fast_force = should_escalate_fast(question, has_docs=has_docs)
         triage = triage_route(
             user_text=question,
@@ -563,7 +651,6 @@ def ask_question(
 
         answer = chat_completion(model=model, messages=messages, temperature=0.2, max_tokens=700)
 
-        # Sources: only if we actually had docs chunks
         out_sources = sources if has_docs else []
         if has_docs and out_sources:
             answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
@@ -588,7 +675,6 @@ CHAT_MAX_TURNS = 12
 CHAT_SUMMARY_TRIGGER = 18
 CHAT_CONTEXT_CHAR_BUDGET = 14000
 
-# In-memory store (resets on restart)
 CHAT_STORE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -597,7 +683,6 @@ def _now_iso() -> str:
 
 
 def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
-    """Keep newest messages within a rough char budget."""
     out = []
     total = 0
     for m in reversed(messages):
@@ -619,7 +704,6 @@ def _get_user_state(user_id: str) -> Dict[str, Any]:
 
 
 def _summarize_if_needed(user_id: str):
-    """Summarize older turns into 'summary' if too many messages. Always uses MINI."""
     state = _get_user_state(user_id)
     msgs = state["messages"]
 
@@ -679,22 +763,16 @@ async def chat_api(
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # ---- Access control ----
         access_folders = ["documents/public"]
         if user_id.lower().endswith("@erp-is.com"):
             access_folders.append("documents/internal")
         elif INTERNAL_USERS.get(user_id):
             access_folders.append("documents/internal")
 
-        # ---- Conversation state ----
         state = _get_user_state(user_id)
-
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
         _summarize_if_needed(user_id)
 
-        # -----------------------------
-        # 1) CHAT MEMORY / META QUERIES
-        # -----------------------------
         msg_lc = message.lower().strip()
 
         def is_chat_memory_question(s: str) -> bool:
@@ -735,9 +813,6 @@ async def chat_api(
             state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
             return {"answer": answer, "user_id": user_id, "sources": []}
 
-        # ----------------------------------
-        # 2) NORMAL FLOW: DOCS RAG + MEMORY
-        # ----------------------------------
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
@@ -829,9 +904,9 @@ def chat_ui():
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
+  <meta charset=\"utf-8\" />
   <title>Conversation Bot (Per User)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
     .row { display: flex; gap: 12px; margin-bottom: 12px; }
@@ -851,19 +926,19 @@ def chat_ui():
 <body>
 
 <h2>Conversation Bot (per user)</h2>
-<p class="muted">Cette page est séparée du bot Slack/one-shot. La mémoire est en RAM (reset au restart).</p>
+<p class=\"muted\">Cette page est séparée du bot Slack/one-shot. La mémoire est en RAM (reset au restart).</p>
 
-<div class="row">
-  <input id="user_id" placeholder="user_id (ex: email ou username)" />
-  <button onclick="newChat()">New chat</button>
+<div class=\"row\">
+  <input id=\"user_id\" placeholder=\"user_id (ex: email ou username)\" />
+  <button onclick=\"newChat()\">New chat</button>
 </div>
 
-<div id="chat"></div>
+<div id=\"chat\"></div>
 
-<div style="margin-top: 12px;">
-  <textarea id="msg" placeholder="Tape ton message..."></textarea>
-  <div class="row">
-    <button onclick="send()">Send</button>
+<div style=\"margin-top: 12px;\">
+  <textarea id=\"msg\" placeholder=\"Tape ton message...\"></textarea>
+  <div class=\"row\">
+    <button onclick=\"send()\">Send</button>
   </div>
 </div>
 
