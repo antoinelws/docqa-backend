@@ -31,6 +31,11 @@ TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Option B: mini by default + escalate to 5.2 when needed
+MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
+MODEL_BIG = os.getenv("OPENAI_MODEL_BIG", "gpt-5.2")
+TRIAGE_CONFIDENCE_THRESHOLD = float(os.getenv("TRIAGE_THRESHOLD", "0.82"))
+
 DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
 FOLDER_PATH = "AI"
 
@@ -45,6 +50,129 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
 INTERNAL_USER_FILE = "internal_users.json"
+
+
+# =========================
+# OpenAI helpers
+# =========================
+def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, max_tokens: int = 700) -> str:
+    """
+    Wrapper compatible with your current OpenAI SDK usage (ChatCompletion).
+    """
+    import openai
+
+    openai.api_key = OPENAI_API_KEY
+    resp = openai.ChatCompletion.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def should_escalate_fast(text: str, has_docs: bool) -> bool:
+    """
+    Cheap deterministic guardrail: forces escalation on sensitive/complex signals.
+    Keeps your "low tolerance" behavior even if triage JSON fails.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+
+    # Long / potentially multi-step
+    if len(t) > 700:
+        return True
+
+    # Sensitive / precision-critical topics
+    keywords = [
+        "billing", "invoice", "pricing", "price", "cost", "facturation", "devis",
+        "security", "sécurité", "apikey", "api key", "token", "secret", "credential",
+        "rgpd", "gdpr", "contract", "contrat", "legal", "juridique",
+        "delete", "remove", "drop", "purge", "irreversible", "production"
+    ]
+    if any(k in t for k in keywords):
+        return True
+
+    # If no docs, and user asks for a precise "how/why" → escalate more often
+    if not has_docs and any(x in t for x in ["how", "why", "comment", "pourquoi", "explain", "explique"]):
+        return True
+
+    return False
+
+
+def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = "") -> dict:
+    """
+    Triage using MODEL_MINI returning strict JSON.
+    If JSON is invalid → safe fallback = escalate.
+    """
+    user_text = (user_text or "").strip()
+
+    system = (
+        "You are a routing classifier for an assistant.\n"
+        "Decide if the request can be answered safely and correctly by a small/cheap model "
+        "or if it must be escalated to a high-quality model.\n"
+        "Return ONLY valid JSON with the exact keys specified.\n\n"
+        "Escalate if:\n"
+        "- confidence is low\n"
+        "- request is multi-step, ambiguous, or requires careful reasoning\n"
+        "- request is sensitive (security, credentials, billing, legal, irreversible actions)\n"
+        "- answer requires long structured output or high precision\n"
+        "- documentation is missing/unclear and the user expects correctness\n"
+    )
+
+    payload = {
+        "mode": mode,  # "slack" | "web"
+        "has_docs": has_docs,
+        "context_hint": (context_hint or "")[:1500],
+        "user_message": user_text[:5000],
+        "output_schema": {
+            "route": "mini|escalate",
+            "confidence": "0.0-1.0",
+            "answer_draft": "string (only if route=mini)",
+            "handoff": {
+                "summary": "string",
+                "key_facts": "array of strings",
+                "open_questions": "array of strings"
+            }
+        }
+    }
+
+    raw = chat_completion(
+        model=MODEL_MINI,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.0,
+        max_tokens=450,
+    )
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {
+            "route": "escalate",
+            "confidence": 0.0,
+            "answer_draft": "",
+            "handoff": {"summary": "", "key_facts": [], "open_questions": []},
+        }
+
+    route = (data.get("route") or "").strip().lower()
+    conf = data.get("confidence", 0.0)
+    try:
+        conf = float(conf)
+    except Exception:
+        conf = 0.0
+
+    if route not in ("mini", "escalate"):
+        route = "escalate"
+
+    data["route"] = route
+    data["confidence"] = conf
+    if "handoff" not in data or not isinstance(data["handoff"], dict):
+        data["handoff"] = {"summary": "", "key_facts": [], "open_questions": []}
+    return data
 
 
 # =========================
@@ -183,8 +311,6 @@ def load_folder_indexes_with_names(folder: str) -> List[Tuple[str, List[str], fa
     """
     Same as load_folder_indexes, but includes doc name (basename without extension).
     Returns: List[(doc_name, chunks, index)]
-
-    NOTE: cached; call clear_index_cache() after upload/sync.
     """
     results: List[Tuple[str, List[str], faiss.Index]] = []
     paths = glob.glob(f"{folder}/*.json")
@@ -270,7 +396,6 @@ def sync_sharepoint():
         file_data = requests.get(download_url, timeout=120)
         file_data.raise_for_status()
 
-        # keep original file locally (optional)
         dest_path = subfolder / name
         with open(dest_path, "wb") as f:
             f.write(file_data.content)
@@ -389,181 +514,8 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
 
 # =========================
-# One-shot QA (/ask) - docs-first + fallback
+# Retrieve (with sources)
 # =========================
-@app.post("/ask")
-def ask_question(
-    question: str = Form(...),
-    user_email: str = Form(...),
-    debug: bool = Form(False),
-):
-    try:
-        import openai
-        openai.api_key = OPENAI_API_KEY
-
-        question = (question or "").strip()
-        user_email = (user_email or "").strip()
-
-        # Access control
-        access_folders = ["documents/public"]
-        if user_email and user_email.endswith("@erp-is.com"):
-            access_folders.append("documents/internal")
-        elif INTERNAL_USERS.get(user_email):
-            access_folders.append("documents/internal")
-
-        # Retrieve
-        chunks, sources = retrieve_chunks_with_sources(
-            question=question,
-            access_folders=access_folders,
-            k_per_doc=8,
-            max_total=12,
-            chunk_max_chars=1200,
-            debug=debug,
-        )
-
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
-
-        system_rules = (
-            "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-            "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-        )
-
-        messages = [
-            {"role": "system", "content": system_rules},
-            {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
-            {"role": "user", "content": question},
-        ]
-
-        resp = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=700,
-        )
-
-        answer = (resp.choices[0].message.content or "").strip()
-
-        # ✅ Sources: only if we actually had docs chunks
-        if chunks and sources:
-            answer = answer.rstrip() + "\n\nSources: " + ", ".join(sources)
-
-        return {"answer": answer, "sources": sources}
-
-    except Exception as e:
-        return {"error": str(e)}
-
-# =========================
-# Conversation (per-user) + RAG
-# =========================
-CHAT_MODEL = "gpt-4"          # or "gpt-4o-mini" later
-CHAT_MAX_TURNS = 12
-CHAT_SUMMARY_TRIGGER = 18
-CHAT_CONTEXT_CHAR_BUDGET = 14000
-
-# In-memory store (resets on restart)
-CHAT_STORE: Dict[str, Dict[str, Any]] = {}
-
-
-def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
-
-
-def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
-    """Keep newest messages within a rough char budget."""
-    out = []
-    total = 0
-    for m in reversed(messages):
-        c = (m.get("content") or "").strip()
-        if not c:
-            continue
-        size = len(c) + 50
-        if total + size > budget_chars and out:
-            break
-        out.append({"role": m["role"], "content": c})
-        total += size
-    return list(reversed(out))
-
-
-def _get_user_state(user_id: str) -> Dict[str, Any]:
-    if user_id not in CHAT_STORE:
-        CHAT_STORE[user_id] = {"summary": "", "messages": []}
-    return CHAT_STORE[user_id]
-
-
-def _summarize_if_needed(user_id: str):
-    """Summarize older turns into 'summary' if too many messages."""
-    state = _get_user_state(user_id)
-    msgs = state["messages"]
-
-    if len(msgs) <= CHAT_SUMMARY_TRIGGER:
-        return
-
-    keep = msgs[-CHAT_MAX_TURNS:]
-    old = msgs[:-CHAT_MAX_TURNS]
-    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
-
-    if not old_text.strip():
-        state["messages"] = keep
-        return
-
-    import openai
-
-    openai.api_key = OPENAI_API_KEY
-
-    summary_prompt = f"""You are maintaining a running summary of a chat.
-
-Current summary (may be empty):
-{state['summary']}
-
-New dialogue to summarize:
-{old_text}
-
-Update the summary. Keep it factual and concise. Preserve decisions, constraints, names, and open questions.
-"""
-
-    try:
-        resp = openai.ChatCompletion.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": "You summarize chat history into a concise running memory."},
-                {"role": "user", "content": summary_prompt},
-            ],
-            temperature=0.2,
-        )
-        state["summary"] = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("[CHAT] summarization failed:", e)
-
-    state["messages"] = keep
-
-
-def _trim_chars(s: str, max_chars: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars].rstrip() + "…"
-
-
-def _trim_list_to_char_budget(items: List[str], budget_chars: int) -> List[str]:
-    out = []
-    total = 0
-    for it in items:
-        it = (it or "").strip()
-        if not it:
-            continue
-        add = len(it) + 5
-        if out and (total + add) > budget_chars:
-            break
-        out.append(it)
-        total += add
-    return out
-
-
 def retrieve_chunks_with_sources(
     question: str,
     access_folders: List[str],
@@ -617,7 +569,6 @@ def retrieve_chunks_with_sources(
 
     scored.sort(key=lambda x: x[0])  # smaller = better
 
-    # Dedupe chunks, keep top max_total
     seen_chunks = set()
     chunks: List[str] = []
     sources_ordered: List[str] = []
@@ -636,7 +587,6 @@ def retrieve_chunks_with_sources(
         if len(chunks) >= max_total:
             break
 
-    # Unique sources (deduped in order)
     uniq_sources: List[str] = []
     seen_src = set()
     for s in sources_ordered:
@@ -648,11 +598,176 @@ def retrieve_chunks_with_sources(
         print("[RAG][DEBUG] question:", question)
         print("[RAG][DEBUG] access_folders:", access_folders)
         print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
-        for i, c in enumerate(chunks[:6], start=1):
-            print(f"[RAG][DEBUG] chunk#{i}:", c.replace("\n", " ")[:240])
 
     return chunks, uniq_sources
 
+
+# =========================
+# One-shot QA (/ask) - docs-first + fallback + Option B routing
+# =========================
+@app.post("/ask")
+def ask_question(
+    question: str = Form(...),
+    user_email: str = Form(...),
+    debug: bool = Form(False),
+):
+    try:
+        question = (question or "").strip()
+        user_email = (user_email or "").strip()
+
+        # Access control
+        access_folders = ["documents/public"]
+        if user_email and user_email.endswith("@erp-is.com"):
+            access_folders.append("documents/internal")
+        elif INTERNAL_USERS.get(user_email):
+            access_folders.append("documents/internal")
+
+        # Retrieve
+        chunks, sources = retrieve_chunks_with_sources(
+            question=question,
+            access_folders=access_folders,
+            k_per_doc=8,
+            max_total=12,
+            chunk_max_chars=1200,
+            debug=debug,
+        )
+
+        has_docs = bool(chunks)
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+
+        system_rules = (
+            "You are the ShipERP assistant.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a concise general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+            "Be practical and sufficiently detailed to be useful.\n"
+            "Do NOT include any 'Sources' section in your answer."
+        )
+
+        messages = [
+            {"role": "system", "content": system_rules},
+            {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+            {"role": "user", "content": question},
+        ]
+
+        # Option B routing
+        fast_force = should_escalate_fast(question, has_docs=has_docs)
+        triage = triage_route(
+            user_text=question,
+            mode="slack_one_shot",
+            has_docs=has_docs,
+            context_hint="One-shot question. Docs excerpts provided." if has_docs else "One-shot question. No docs found.",
+        )
+
+        use_mini = (
+            (not fast_force)
+            and triage.get("route") == "mini"
+            and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
+        )
+        model = MODEL_MINI if use_mini else MODEL_BIG
+
+        answer = chat_completion(model=model, messages=messages, temperature=0.2, max_tokens=700)
+
+        # Sources: only if we actually had docs chunks
+        out_sources = sources if has_docs else []
+        if has_docs and out_sources:
+            answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+
+        payload = {"answer": answer, "sources": out_sources}
+        if debug:
+            payload["routed_model"] = model
+            payload["triage"] = triage
+            payload["fast_force_escalate"] = fast_force
+            payload["threshold"] = TRIAGE_CONFIDENCE_THRESHOLD
+
+        return payload
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =========================
+# Conversation (per-user) + RAG + Option B routing
+# =========================
+CHAT_MAX_TURNS = 12
+CHAT_SUMMARY_TRIGGER = 18
+CHAT_CONTEXT_CHAR_BUDGET = 14000
+
+# In-memory store (resets on restart)
+CHAT_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
+    """Keep newest messages within a rough char budget."""
+    out = []
+    total = 0
+    for m in reversed(messages):
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        size = len(c) + 50
+        if total + size > budget_chars and out:
+            break
+        out.append({"role": m["role"], "content": c})
+        total += size
+    return list(reversed(out))
+
+
+def _get_user_state(user_id: str) -> Dict[str, Any]:
+    if user_id not in CHAT_STORE:
+        CHAT_STORE[user_id] = {"summary": "", "messages": []}
+    return CHAT_STORE[user_id]
+
+
+def _summarize_if_needed(user_id: str):
+    """Summarize older turns into 'summary' if too many messages. Always uses MINI."""
+    state = _get_user_state(user_id)
+    msgs = state["messages"]
+
+    if len(msgs) <= CHAT_SUMMARY_TRIGGER:
+        return
+
+    keep = msgs[-CHAT_MAX_TURNS:]
+    old = msgs[:-CHAT_MAX_TURNS]
+    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+
+    if not old_text.strip():
+        state["messages"] = keep
+        return
+
+    summary_prompt = f"""You are maintaining a running summary of a chat.
+
+Current summary (may be empty):
+{state['summary']}
+
+New dialogue to summarize:
+{old_text}
+
+Update the summary. Keep it factual and concise. Preserve decisions, constraints, names, and open questions.
+"""
+
+    try:
+        new_summary = chat_completion(
+            model=MODEL_MINI,
+            messages=[
+                {"role": "system", "content": "You summarize chat history into a concise running memory."},
+                {"role": "user", "content": summary_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=450,
+        )
+        state["summary"] = new_summary.strip()
+    except Exception as e:
+        print("[CHAT] summarization failed:", e)
+
+    state["messages"] = keep
 
 
 @app.post("/chat-api")
@@ -664,14 +779,11 @@ async def chat_api(
     """
     Stateful chat per user_id + docs RAG.
 
-    Fix:
-    - If the user asks about the chat history (memory/meta questions),
-      we answer directly from CHAT_STORE (no docs, no sources).
-    - Otherwise: docs-first + fallback + sources (doc file names only).
+    - If the user asks about chat history (memory/meta), answer directly from store.
+    - Otherwise: docs-first + fallback + sources appended by server.
+    - Option B: MODEL_MINI by default, escalate to MODEL_BIG when needed.
     """
     try:
-        import openai
-        import numpy as np
         import re
 
         user_id = (user_id or "").strip()
@@ -682,7 +794,7 @@ async def chat_api(
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
-        # ---- Access control (same as /ask) ----
+        # ---- Access control ----
         access_folders = ["documents/public"]
         if user_id.lower().endswith("@erp-is.com"):
             access_folders.append("documents/internal")
@@ -692,10 +804,10 @@ async def chat_api(
         # ---- Conversation state ----
         state = _get_user_state(user_id)
 
-        # Append user message first (so the store is always complete)
+        # Append user message first
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
 
-        # Summarize older turns if needed
+        # Summarize older turns if needed (MINI)
         _summarize_if_needed(user_id)
 
         # -----------------------------
@@ -704,7 +816,6 @@ async def chat_api(
         msg_lc = message.lower().strip()
 
         def is_chat_memory_question(s: str) -> bool:
-            # English + FR common phrasing
             patterns = [
                 r"\bfirst question\b",
                 r"\bmy first question\b",
@@ -724,14 +835,12 @@ async def chat_api(
             return any(re.search(p, s) for p in patterns)
 
         if is_chat_memory_question(msg_lc):
-            # Find the first user question in THIS chat (excluding empty and excluding the current question itself)
             user_msgs = [
                 m.get("content", "").strip()
                 for m in state.get("messages", [])
                 if m.get("role") == "user" and (m.get("content") or "").strip()
             ]
 
-            # Remove the current question (last one) if it matches
             if user_msgs and user_msgs[-1].strip().lower() == message.strip().lower():
                 user_msgs = user_msgs[:-1]
 
@@ -741,7 +850,6 @@ async def chat_api(
             else:
                 answer = "I don't have any earlier question stored in this chat yet."
 
-            # store assistant reply so the conversation continues consistently
             state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
             return {"answer": answer, "user_id": user_id, "sources": []}
 
@@ -751,103 +859,18 @@ async def chat_api(
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # ---- small local helpers ----
-        def _trim_chars_local(s: str, n: int) -> str:
-            s = (s or "").strip()
-            if len(s) <= n:
-                return s
-            return s[:n].rstrip() + "…"
+        # Retrieve chunks WITH sources
+        chunks, uniq_sources = retrieve_chunks_with_sources(
+            question=message,
+            access_folders=access_folders,
+            k_per_doc=6,
+            max_total=12,
+            chunk_max_chars=1200,
+            debug=debug,
+        )
+        has_docs = bool(chunks)
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
 
-        def _trim_list_to_char_budget_local(items: list[str], budget_chars: int) -> list[str]:
-            out, total = [], 0
-            for it in items:
-                it = (it or "").strip()
-                if not it:
-                    continue
-                add = len(it) + 5
-                if out and (total + add) > budget_chars:
-                    break
-                out.append(it)
-                total += add
-            return out
-
-        # ---- Embed question ----
-        qvecs = embed_texts([message])
-        if not qvecs:
-            return JSONResponse({"error": "Invalid question (not embeddable)."}, status_code=400)
-        qvec = qvecs[0]
-
-        # ---- Retrieve chunks WITH sources (doc base name) ----
-        scored: list[tuple[float, str, str]] = []  # (dist, chunk, doc_name)
-
-        for folder in access_folders:
-            json_paths = glob.glob(f"{folder}/*.json")
-            for json_path in json_paths:
-                base = os.path.splitext(os.path.basename(json_path))[0]
-                index_path = os.path.join(folder, f"{base}.index")
-                if not os.path.exists(index_path):
-                    continue
-
-                try:
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        chunks_list = json.load(f)
-                    index = faiss.read_index(index_path)
-                except Exception as e:
-                    if debug:
-                        print("[CHAT][DEBUG] Failed loading doc:", json_path, "err:", e)
-                    continue
-
-                D, I = index.search(np.array([qvec]).astype("float32"), k=6)
-                for dist, idx in zip(D[0], I[0]):
-                    if 0 <= idx < len(chunks_list):
-                        c = chunks_list[idx]
-                        if c:
-                            scored.append((float(dist), str(c), base))
-
-        scored.sort(key=lambda x: x[0])
-
-        # Deduplicate chunks; keep sources aligned
-        seen_chunks = set()
-        chosen_chunks: list[str] = []
-        chosen_sources: list[str] = []
-
-        for dist, c, doc_name in scored:
-            c = (c or "").strip()
-            if not c:
-                continue
-            if c in seen_chunks:
-                continue
-            seen_chunks.add(c)
-
-            chosen_chunks.append(_trim_chars_local(c, 1200))
-            chosen_sources.append(doc_name)
-
-            if len(chosen_chunks) >= 12:
-                break
-
-        chosen_chunks = _trim_list_to_char_budget_local(chosen_chunks, budget_chars=9000)
-        chosen_sources = chosen_sources[: len(chosen_chunks)]
-
-        # Unique file names only, preserve order
-        uniq_sources: list[str] = []
-        seen_src = set()
-        for s in chosen_sources:
-            if s and s not in seen_src:
-                seen_src.add(s)
-                uniq_sources.append(s)
-
-        if debug:
-            print("[CHAT][DEBUG] user_id:", user_id)
-            print("[CHAT][DEBUG] message:", message)
-            print("[CHAT][DEBUG] access_folders:", access_folders)
-            print("[CHAT][DEBUG] retrieved_chunks:", len(chosen_chunks))
-            print("[CHAT][DEBUG] sources:", uniq_sources)
-
-        docs_block = "\n---\n".join(chosen_chunks) if chosen_chunks else "(none found for this question)"
-
-        # IMPORTANT:
-        # Do NOT let the model invent "Sources:".
-        # We'll append sources ourselves ONLY if answer is docs-based.
         system_rules = (
             "You are the ShipERP assistant.\n"
             "You must answer FIRST using the documentation excerpts provided below.\n"
@@ -866,38 +889,60 @@ async def chat_api(
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
-        openai.api_key = OPENAI_API_KEY
-        resp = openai.ChatCompletion.create(
-            model=CHAT_MODEL,
+        # Option B routing
+        fast_force = should_escalate_fast(message, has_docs=has_docs)
+        triage = triage_route(
+            user_text=message,
+            mode="web_chat",
+            has_docs=has_docs,
+            context_hint=(f"Summary:\n{summary}\n\nRecent turns count: {len(recent)}") if summary else f"Recent turns count: {len(recent)}",
+        )
+
+        use_mini = (
+            (not fast_force)
+            and triage.get("route") == "mini"
+            and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
+        )
+        model = MODEL_MINI if use_mini else MODEL_BIG
+
+        answer = chat_completion(
+            model=model,
             messages=messages,
             temperature=0.3,
             max_tokens=900,
         )
 
-        answer = (resp.choices[0].message.content or "").strip()
-
-        # Append sources ONLY if docs-based.
-        # (If the model used the fallback sentence => no sources, as requested.)
+        # Append sources ONLY if docs-based (no fallback marker)
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
         if answer.lower().startswith(fallback_marker):
-            final_answer = answer  # no sources in fallback mode
+            final_answer = answer
             out_sources = []
         else:
-            out_sources = uniq_sources
+            out_sources = uniq_sources if has_docs else []
             if out_sources:
                 final_answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
             else:
-                final_answer = answer  # no sources if we had no chunks
+                final_answer = answer
 
         state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
 
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        return {"answer": final_answer, "user_id": user_id, "sources": out_sources}
+        payload = {"answer": final_answer, "user_id": user_id, "sources": out_sources}
+        if debug:
+            payload["routed_model"] = model
+            payload["triage"] = triage
+            payload["fast_force_escalate"] = fast_force
+            payload["threshold"] = TRIAGE_CONFIDENCE_THRESHOLD
+            payload["has_docs"] = has_docs
+            payload["models"] = {"mini": MODEL_MINI, "big": MODEL_BIG}
+
+        return payload
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.get("/chat-ui", response_class=HTMLResponse)
 def chat_ui():
@@ -1058,7 +1103,8 @@ def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
 
     try:
-        result = ask_question(question=question, user_email=user_email)  # one-shot
+        # one-shot (/ask) now auto-routes mini/big
+        result = ask_question(question=question, user_email=user_email, debug=False)
         text = result.get("answer") or result.get("error") or "No answer."
     except Exception as e:
         text = f"Error while processing: {str(e)}"
