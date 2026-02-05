@@ -56,9 +56,7 @@ INTERNAL_USER_FILE = "internal_users.json"
 # OpenAI helpers
 # =========================
 def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, max_tokens: int = 700) -> str:
-    """
-    Wrapper compatible with your current OpenAI SDK usage (ChatCompletion).
-    """
+    """Wrapper compatible with your current OpenAI SDK usage (ChatCompletion)."""
     import openai
 
     openai.api_key = OPENAI_API_KEY
@@ -72,29 +70,23 @@ def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, 
 
 
 def should_escalate_fast(text: str, has_docs: bool) -> bool:
-    """
-    Cheap deterministic guardrail: forces escalation on sensitive/complex signals.
-    Keeps your "low tolerance" behavior even if triage JSON fails.
-    """
+    """Cheap deterministic guardrail to force escalation on sensitive/complex signals."""
     t = (text or "").strip().lower()
     if not t:
         return True
 
-    # Long / potentially multi-step
     if len(t) > 700:
         return True
 
-    # Sensitive / precision-critical topics
     keywords = [
         "billing", "invoice", "pricing", "price", "cost", "facturation", "devis",
         "security", "sécurité", "apikey", "api key", "token", "secret", "credential",
         "rgpd", "gdpr", "contract", "contrat", "legal", "juridique",
-        "delete", "remove", "drop", "purge", "irreversible", "production"
+        "delete", "remove", "drop", "purge", "irreversible", "production",
     ]
     if any(k in t for k in keywords):
         return True
 
-    # If no docs, and user asks for a precise "how/why" → escalate more often
     if not has_docs and any(x in t for x in ["how", "why", "comment", "pourquoi", "explain", "explique"]):
         return True
 
@@ -102,10 +94,7 @@ def should_escalate_fast(text: str, has_docs: bool) -> bool:
 
 
 def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = "") -> dict:
-    """
-    Triage using MODEL_MINI returning strict JSON.
-    If JSON is invalid → safe fallback = escalate.
-    """
+    """Triage using MODEL_MINI returning strict JSON. If invalid JSON → escalate."""
     user_text = (user_text or "").strip()
 
     system = (
@@ -122,7 +111,7 @@ def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = 
     )
 
     payload = {
-        "mode": mode,  # "slack" | "web"
+        "mode": mode,
         "has_docs": has_docs,
         "context_hint": (context_hint or "")[:1500],
         "user_message": user_text[:5000],
@@ -133,9 +122,9 @@ def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = 
             "handoff": {
                 "summary": "string",
                 "key_facts": "array of strings",
-                "open_questions": "array of strings"
-            }
-        }
+                "open_questions": "array of strings",
+            },
+        },
     }
 
     raw = chat_completion(
@@ -247,12 +236,7 @@ def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
 # Embeddings (safe)
 # =========================
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
-    """
-    Safe embedding:
-    - filters invalid entries
-    - truncates long text
-    - never crashes sync: skips failing batches
-    """
+    """Safe embedding; skips failing batches."""
     import openai
 
     openai.api_key = OPENAI_API_KEY
@@ -273,7 +257,7 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
 
     vectors: List[List[float]] = []
     for i in range(0, len(clean_texts), batch_size):
-        batch = clean_texts[i:i + batch_size]
+        batch = clean_texts[i : i + batch_size]
         try:
             resp = openai.Embedding.create(model=EMBEDDING_MODEL, input=batch)
             vectors.extend([d["embedding"] for d in resp["data"]])
@@ -308,10 +292,7 @@ def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
 
 @lru_cache(maxsize=8)
 def load_folder_indexes_with_names(folder: str) -> List[Tuple[str, List[str], faiss.Index]]:
-    """
-    Same as load_folder_indexes, but includes doc name (basename without extension).
-    Returns: List[(doc_name, chunks, index)]
-    """
+    """Same as load_folder_indexes, but includes doc name (basename)."""
     results: List[Tuple[str, List[str], faiss.Index]] = []
     paths = glob.glob(f"{folder}/*.json")
 
@@ -514,95 +495,6 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
 
 # =========================
-# Retrieve (with sources)
-# =========================
-def retrieve_chunks_with_sources(
-    question: str,
-    access_folders: List[str],
-    k_per_doc: int = 6,
-    max_total: int = 12,
-    chunk_max_chars: int = 1200,
-    debug: bool = False,
-) -> Tuple[List[str], List[str]]:
-    """
-    Returns:
-      chunks: list[str] (deduped best chunks)
-      sources: list[str] unique doc basenames (deduped, in order of first appearance)
-    """
-    question = (question or "").strip()
-    if not question:
-        return [], []
-
-    qvecs = embed_texts([question])
-    if not qvecs:
-        return [], []
-    qvec = qvecs[0]
-
-    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
-
-    for folder in access_folders:
-        json_paths = glob.glob(f"{folder}/*.json")
-        for json_path in json_paths:
-            base = os.path.splitext(os.path.basename(json_path))[0]
-            index_path = os.path.join(folder, f"{base}.index")
-            if not os.path.exists(index_path):
-                continue
-
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    chunks_list = json.load(f)
-                index = faiss.read_index(index_path)
-            except Exception as e:
-                if debug:
-                    print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
-                continue
-
-            D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
-            for dist, idx in zip(D[0], I[0]):
-                if 0 <= idx < len(chunks_list):
-                    c = (chunks_list[idx] or "").strip()
-                    if c:
-                        scored.append((float(dist), c, base))
-
-    if not scored:
-        return [], []
-
-    scored.sort(key=lambda x: x[0])  # smaller = better
-
-    seen_chunks = set()
-    chunks: List[str] = []
-    sources_ordered: List[str] = []
-
-    for dist, c, doc_base in scored:
-        if c in seen_chunks:
-            continue
-        seen_chunks.add(c)
-
-        if len(c) > chunk_max_chars:
-            c = c[:chunk_max_chars].rstrip() + "…"
-
-        chunks.append(c)
-        sources_ordered.append(doc_base)
-
-        if len(chunks) >= max_total:
-            break
-
-    uniq_sources: List[str] = []
-    seen_src = set()
-    for s in sources_ordered:
-        if s and s not in seen_src:
-            seen_src.add(s)
-            uniq_sources.append(s)
-
-    if debug:
-        print("[RAG][DEBUG] question:", question)
-        print("[RAG][DEBUG] access_folders:", access_folders)
-        print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
-
-    return chunks, uniq_sources
-
-
-# =========================
 # One-shot QA (/ask) - docs-first + fallback + Option B routing
 # =========================
 @app.post("/ask")
@@ -776,13 +668,6 @@ async def chat_api(
     message: str = Form(...),
     debug: bool = Form(False),
 ):
-    """
-    Stateful chat per user_id + docs RAG.
-
-    - If the user asks about chat history (memory/meta), answer directly from store.
-    - Otherwise: docs-first + fallback + sources appended by server.
-    - Option B: MODEL_MINI by default, escalate to MODEL_BIG when needed.
-    """
     try:
         import re
 
@@ -804,10 +689,7 @@ async def chat_api(
         # ---- Conversation state ----
         state = _get_user_state(user_id)
 
-        # Append user message first
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
-
-        # Summarize older turns if needed (MINI)
         _summarize_if_needed(user_id)
 
         # -----------------------------
@@ -859,7 +741,6 @@ async def chat_api(
         summary = (state["summary"] or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # Retrieve chunks WITH sources
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=message,
             access_folders=access_folders,
@@ -889,7 +770,6 @@ async def chat_api(
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
-        # Option B routing
         fast_force = should_escalate_fast(message, has_docs=has_docs)
         triage = triage_route(
             user_text=message,
@@ -912,7 +792,6 @@ async def chat_api(
             max_tokens=900,
         )
 
-        # Append sources ONLY if docs-based (no fallback marker)
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
         if answer.lower().startswith(fallback_marker):
             final_answer = answer
@@ -1093,7 +972,7 @@ def post_to_slack(response_url: str, text: str):
         requests.post(
             response_url,
             json={"response_type": "in_channel", "text": text},
-            timeout=10
+            timeout=10,
         )
     except Exception as e:
         print("[DEBUG][SLACK] error posting follow-up:", e)
@@ -1103,7 +982,6 @@ def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
 
     try:
-        # one-shot (/ask) now auto-routes mini/big
         result = ask_question(question=question, user_email=user_email, debug=False)
         text = result.get("answer") or result.get("error") or "No answer."
     except Exception as e:
