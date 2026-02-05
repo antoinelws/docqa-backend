@@ -55,7 +55,7 @@ INTERNAL_USER_FILE = "internal_users.json"
 # =========================
 # OpenAI helpers
 # =========================
-def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, max_tokens: int = 700) -> str:
+def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, max_completion_tokens: int = 700) -> str:
     """Wrapper compatible with your current OpenAI SDK usage (ChatCompletion)."""
     import openai
 
@@ -64,7 +64,7 @@ def chat_completion(model: str, messages: List[dict], temperature: float = 0.2, 
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+         max_completion_tokens=max_completion_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -134,7 +134,7 @@ def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = 
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         temperature=0.0,
-        max_tokens=450,
+        max_completion_tokens=450,
     )
 
     try:
@@ -649,7 +649,7 @@ def ask_question(
         )
         model = MODEL_MINI if use_mini else MODEL_BIG
 
-        answer = chat_completion(model=model, messages=messages, temperature=0.2, max_tokens=700)
+        answer = chat_completion(model=model, messages=messages, temperature=0.2, max_completion_tokens=700)
 
         out_sources = sources if has_docs else []
         if has_docs and out_sources:
@@ -737,7 +737,7 @@ Update the summary. Keep it factual and concise. Preserve decisions, constraints
                 {"role": "user", "content": summary_prompt},
             ],
             temperature=0.2,
-            max_tokens=450,
+            max_completion_tokens=450,
         )
         state["summary"] = new_summary.strip()
     except Exception as e:
@@ -864,7 +864,7 @@ async def chat_api(
             model=model,
             messages=messages,
             temperature=0.3,
-            max_tokens=900,
+            max_completion_tokens=900,
         )
 
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
