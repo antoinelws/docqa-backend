@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, List, Any, Tuple
-
+import re
 import requests
 import pdfplumber
 import docx
@@ -518,8 +518,6 @@ def retrieve_chunks_with_sources(
       chunks: list[str] (deduped best chunks)
       sources: list[str] unique doc basenames (deduped, in order of first appearance)
     """
-    import re
-
     question = (question or "").strip()
     if not question:
         return [], []
@@ -807,8 +805,6 @@ async def chat_api(
     debug: bool = Form(False),
 ):
     try:
-        import re
-
         user_id = (user_id or "").strip()
         message = (message or "").strip()
 
