@@ -9,3 +9,6 @@ msal
 python-dotenv
 requests
 numpy
+bcrypt==4.1.3
+
+
