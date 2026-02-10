@@ -94,16 +94,14 @@ def extract_text(filename: str, content: bytes) -> str:
             tmp.write(content)
             tmp.flush()
             with pdfplumber.open(tmp.name) as pdf:
-                return "
-".join(page.extract_text() or "" for page in pdf.pages)
+                return ""\n".join(page.extract_text() or "" for page in pdf.pages)
 
     if ext == "docx":
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(content)
             tmp.flush()
             doc = docx.Document(tmp.name)
-            return "
-".join(p.text for p in doc.paragraphs)
+            return ""\n".join(p.text for p in doc.paragraphs)
 
     if ext == "txt":
         try:
