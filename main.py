@@ -654,13 +654,9 @@ def ask_question(
         # If we DO have docs, but the model still claims docs don't mention it,
         # do one forced retry with the big model and stricter instruction.
         if has_docs and answer.lower().startswith(fallback_marker):
-            retry_rules = (
-                system_rules
-                + "
+            retry_rules = system_rules + "
 
-IMPORTANT: Relevant documentation IS provided above. "
-                + "Do NOT use the fallback sentence. Answer strictly from the excerpts."
-            )
+IMPORTANT: Relevant documentation IS provided above. Do NOT use the fallback sentence. Answer strictly from the excerpts."
             retry_messages = [
                 {"role": "system", "content": retry_rules},
                 {"role": "system", "content": f"Documentation excerpts:
