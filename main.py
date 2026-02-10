@@ -1,20 +1,9 @@
-import os
-import json
-import glob
-import asyncio
-import datetime
-import tempfile
-import bcrypt
-
-from typing import Dict, Any, Optional
-from fastapi import Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.status import HTTP_303_SEE_OTHER
+import os, json, glob, asyncio, datetime, tempfile
 from pathlib import Path
 from functools import lru_cache
-from typing import Dict, List, Any, Tuple
+from typing import Dict, Any, Optional, List, Tuple
 
+import bcrypt
 import requests
 import pdfplumber
 import docx
@@ -25,9 +14,12 @@ from msal import ConfidentialClientApplication
 
 from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.status import HTTP_303_SEE_OTHER
 
 from sow_estimator import router as estimator_router
+
 
 
 # =========================
@@ -374,14 +366,6 @@ def sync_sharepoint():
     print("Sync complete. Files processed and saved to ./documents/")
 
 
-# =========================
-# Internal users
-# =========================
-if os.path.exists(INTERNAL_USER_FILE):
-    with open(INTERNAL_USER_FILE, "r", encoding="utf-8") as f:
-        INTERNAL_USERS = json.load(f)
-else:
-    INTERNAL_USERS = {}
 
 
 # =========================
@@ -398,6 +382,67 @@ app.add_middleware(
     same_site="lax",
     https_only=True,  # Render = HTTPS => True recommandé
 )
+
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    email = (request.session.get("user_email") or "").strip().lower()
+    if get_user_tier(email):
+        return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Login - ShipERP AI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 520px; }
+    input, button { font-size: 14px; padding: 10px; width: 100%; margin-top: 10px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
+    .muted { color: #666; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>ShipERP AI Assistant</h2>
+    <form method="post" action="/login">
+      <input name="email" placeholder="Email" autocomplete="username" required />
+      <input name="password" placeholder="Password" type="password" autocomplete="current-password" required />
+      <button type="submit">Sign in</button>
+    </form>
+    <div class="muted">Access is restricted to authorized users.</div>
+  </div>
+</body>
+</html>
+"""
+
+
+@app.post("/login")
+def login(request: Request, email: str = Form(...), password: str = Form(...)):
+    email_lc = (email or "").strip().lower()
+
+    # deny-by-default
+    if not get_user_tier(email_lc):
+        return HTMLResponse("<p>Access denied.</p><p><a href='/login'>Back</a></p>", status_code=403)
+
+    # vrai login: nécessite password_hash (un user en "true" ne peut pas se logguer tant que pas migré)
+    if not verify_password(email_lc, password or ""):
+        return HTMLResponse("<p>Invalid credentials.</p><p><a href='/login'>Back</a></p>", status_code=401)
+
+    request.session["user_email"] = email_lc
+    return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+
 
 app.include_router(estimator_router)
 
@@ -570,11 +615,16 @@ def ask_question(
         user_email = (user_email or "").strip()
 
         # Access control
-        access_folders = ["documents/public"]
-        if user_email and user_email.endswith("@erp-is.com"):
-            access_folders.append("documents/internal")
-        elif INTERNAL_USERS.get(user_email):
-            access_folders.append("documents/internal")
+        tier = get_user_tier(user_email)
+        if tier == "internal":
+            access_folders = ["documents/public", "documents/internal"]
+        elif tier == "public":
+            access_folders = ["documents/public"]
+        else:
+            # deny-by-default
+            return JSONResponse({"error": "Access denied"}, status_code=403)
+
+
 
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
@@ -712,26 +762,30 @@ Update the summary. Keep it factual and concise. Preserve decisions, constraints
 
 @app.post("/chat-api")
 async def chat_api(
-    user_id: str = Form(...),
+    request: Request,
     message: str = Form(...),
     debug: bool = Form(False),
 ):
+    email = (request.session.get("user_email") or "").strip().lower()
+    tier = get_user_tier(email)
+    if not tier:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    user_id = email
+
+    if tier == "internal":
+        access_folders = ["documents/public", "documents/internal"]
+    elif tier == "public":
+        access_folders = ["documents/public"]
+    else:
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+
     try:
         import re
 
-        user_id = (user_id or "").strip()
         message = (message or "").strip()
-
-        if not user_id:
-            return JSONResponse({"error": "Missing user_id"}, status_code=400)
         if not message:
             return JSONResponse({"error": "Empty message"}, status_code=400)
-
-        access_folders = ["documents/public"]
-        if user_id.lower().endswith("@erp-is.com"):
-            access_folders.append("documents/internal")
-        elif INTERNAL_USERS.get(user_id):
-            access_folders.append("documents/internal")
 
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
@@ -764,8 +818,6 @@ async def chat_api(
                 for m in state.get("messages", [])
                 if m.get("role") == "user" and (m.get("content") or "").strip()
             ]
-
-            # remove current message if it is exactly the last
             if user_msgs and user_msgs[-1].strip().lower() == message.strip().lower():
                 user_msgs = user_msgs[:-1]
 
@@ -824,7 +876,6 @@ async def chat_api(
 
         state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
 
-        # simple cap
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
@@ -836,14 +887,15 @@ async def chat_api(
         return payload
 
     except Exception as e:
-        # make the error visible for debugging
         return JSONResponse({"error": str(e)}, status_code=500)
 
-
 @app.get("/chat-ui", response_class=HTMLResponse)
+def chat_ui(request: Request):
+    email = (request.session.get("user_email") or "").strip().lower()
+    if not get_user_tier(email):
+        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
-def chat_ui():
-    return """
+    html = """
 <!doctype html>
 <html>
 <head>
@@ -852,9 +904,7 @@ def chat_ui():
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
-    .row { display: flex; gap: 12px; margin-bottom: 12px; }
-    input, textarea, button { font-size: 14px; padding: 10px; }
-    input { flex: 1; }
+    textarea, button { font-size: 14px; padding: 10px; }
     textarea { width: 100%; height: 90px; }
     #chat { border: 1px solid #ddd; padding: 12px; border-radius: 8px; height: 420px; overflow: auto; background: #fafafa; }
     .msg { margin: 10px 0; }
@@ -869,25 +919,23 @@ def chat_ui():
 <body>
 
 <h2>Conversation Bot (per user)</h2>
-<p class="muted">Cette page est séparée du bot Slack/one-shot. La mémoire est en RAM (reset au restart).</p>
-
-<div class="row">
-  <input id="user_id" placeholder="user_id (ex: email ou username)" value="default@erp-is.com" />
-  <button onclick="newChat()">New chat</button>
-</div>
+<p class="muted">Mémoire en RAM (reset au restart). User: <b>__USER_ID__</b></p>
 
 <div id="chat"></div>
 
 <div style="margin-top: 12px;">
   <textarea id="msg" placeholder="Tape ton message..."></textarea>
-  <div class="row">
+  <div style="margin-top: 10px;">
     <button onclick="send()">Send</button>
+    <form method="post" action="/logout" style="display:inline;">
+      <button type="submit">Logout</button>
+    </form>
   </div>
 </div>
 
 <script>
+  const USER_ID = "__USER_ID__";
   const chatEl = document.getElementById('chat');
-  const userIdEl = document.getElementById('user_id');
   const msgEl = document.getElementById('msg');
 
   function append(role, text) {
@@ -912,16 +960,13 @@ def chat_ui():
   }
 
   async function send() {
-    const user_id = (userIdEl.value || '').trim();
     const message = (msgEl.value || '').trim();
-    if (!user_id) return alert('Please set user_id');
     if (!message) return;
 
     append('user', message);
     msgEl.value = '';
 
     const form = new FormData();
-    form.append('user_id', user_id);
     form.append('message', message);
 
     try {
@@ -940,6 +985,7 @@ def chat_ui():
 </body>
 </html>
 """
+    return HTMLResponse(html.replace("__USER_ID__", email))
 
 
 # =========================
