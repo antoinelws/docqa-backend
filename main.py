@@ -65,7 +65,10 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
         messages=messages,
         max_completion_tokens=max_completion_tokens,
     )
-    return (resp.choices[0].message.content or "").strip()e_fast(text: str, has_docs: bool) -> bool:
+    return (resp.choices[0].message.content or "").strip()
+
+
+def should_escalate_fast(text: str, has_docs: bool) -> bool:
     """Cheap deterministic guardrail to force escalation on sensitive/complex signals."""
     t = (text or "").strip().lower()
     if not t:
@@ -123,16 +126,13 @@ def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = 
         },
     }
 
-    raw = chat_completionraw = chat_completion(
+    raw = chat_completion(
         model=MODEL_MINI,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         max_completion_tokens=450,
-    )
-
-    try:etion_tokens=450,
     )
 
     try:
@@ -428,8 +428,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
 sync_in_progress = False
 
 
@@ -645,8 +643,225 @@ def ask_question(
             and triage.get("route") == "mini"
             and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
         )
-        model = MODEL_MINI if answer = chat_completion(model=model, messages=messages, max_completion_tokens=700)          max_completion_tokens=900,
-        )cumentation does not mention this, but here is what i know from general knowledge:"
+        model = MODEL_MINI if use_mini else MODEL_BIG
+
+        answer = chat_completion(model=model, messages=messages, max_completion_tokens=700)
+
+        out_sources = sources if has_docs else []
+        if has_docs and out_sources:
+            answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+
+        payload = {"answer": answer, "sources": out_sources}
+        if debug:
+            payload["routed_model"] = model
+            payload["triage"] = triage
+            payload["fast_force_escalate"] = fast_force
+            payload["threshold"] = TRIAGE_CONFIDENCE_THRESHOLD
+
+        return payload
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =========================
+# Conversation (per-user) + RAG + Option B routing
+# =========================
+CHAT_MAX_TURNS = 12
+CHAT_SUMMARY_TRIGGER = 18
+CHAT_CONTEXT_CHAR_BUDGET = 14000
+
+CHAT_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
+    out = []
+    total = 0
+    for m in reversed(messages):
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        size = len(c) + 50
+        if total + size > budget_chars and out:
+            break
+        out.append({"role": m["role"], "content": c})
+        total += size
+    return list(reversed(out))
+
+
+def _get_user_state(user_id: str) -> Dict[str, Any]:
+    if user_id not in CHAT_STORE:
+        CHAT_STORE[user_id] = {"summary": "", "messages": []}
+    return CHAT_STORE[user_id]
+
+
+def _summarize_if_needed(user_id: str):
+    state = _get_user_state(user_id)
+    msgs = state["messages"]
+
+    if len(msgs) <= CHAT_SUMMARY_TRIGGER:
+        return
+
+    keep = msgs[-CHAT_MAX_TURNS:]
+    old = msgs[:-CHAT_MAX_TURNS]
+    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+
+    if not old_text.strip():
+        state["messages"] = keep
+        return
+
+    summary_prompt = f"""You are maintaining a running summary of a chat.
+
+Current summary (may be empty):
+{state['summary']}
+
+New dialogue to summarize:
+{old_text}
+
+Update the summary. Keep it factual and concise. Preserve decisions, constraints, names, and open questions.
+"""
+
+    try:
+        new_summary = chat_completion(
+            model=MODEL_MINI,
+            messages=[
+                {"role": "system", "content": "You summarize chat history into a concise running memory."},
+                {"role": "user", "content": summary_prompt},
+            ],
+            max_completion_tokens=450,
+        )
+        state["summary"] = new_summary.strip()
+    except Exception as e:
+        print("[CHAT] summarization failed:", e)
+
+    state["messages"] = keep
+
+
+@app.post("/chat-api")
+async def chat_api(
+    user_id: str = Form(...),
+    message: str = Form(...),
+    debug: bool = Form(False),
+):
+    try:
+        import re
+
+        user_id = (user_id or "").strip()
+        message = (message or "").strip()
+
+        if not user_id:
+            return JSONResponse({"error": "Missing user_id"}, status_code=400)
+        if not message:
+            return JSONResponse({"error": "Empty message"}, status_code=400)
+
+        access_folders = ["documents/public"]
+        if user_id.lower().endswith("@erp-is.com"):
+            access_folders.append("documents/internal")
+        elif INTERNAL_USERS.get(user_id):
+            access_folders.append("documents/internal")
+
+        state = _get_user_state(user_id)
+        state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
+        _summarize_if_needed(user_id)
+
+        msg_lc = message.lower().strip()
+
+        def is_chat_memory_question(s: str) -> bool:
+            patterns = [
+                r"\bfirst question\b",
+                r"\bmy first question\b",
+                r"\bwhat was i asking\b",
+                r"\bwhat did i ask\b",
+                r"\bearlier\b.*\b(chat|conversation)\b",
+                r"\bin this chat\b",
+                r"\bin this conversation\b",
+                r"\bwhat did you say\b",
+                r"\bwhat did i say\b",
+                r"\bwhat have we discussed\b",
+                r"\brappelle\b.*\b(premi|première)\b.*\bquestion\b",
+                r"\bc'était quoi\b.*\bma\b.*\b(premi|première)\b.*\bquestion\b",
+                r"\bdans ce chat\b",
+                r"\bdans cette conversation\b",
+            ]
+            return any(re.search(p, s) for p in patterns)
+
+        if is_chat_memory_question(msg_lc):
+            user_msgs = [
+                m.get("content", "").strip()
+                for m in state.get("messages", [])
+                if m.get("role") == "user" and (m.get("content") or "").strip()
+            ]
+
+            if user_msgs and user_msgs[-1].strip().lower() == message.strip().lower():
+                user_msgs = user_msgs[:-1]
+
+            if user_msgs:
+                first_q = user_msgs[0]
+                answer = f'Your first question in this chat was: "{first_q}"'
+            else:
+                answer = "I don't have any earlier question stored in this chat yet."
+
+            state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
+            return {"answer": answer, "user_id": user_id, "sources": []}
+
+        summary = (state["summary"] or "").strip()
+        recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
+
+        chunks, uniq_sources = retrieve_chunks_with_sources(
+            question=message,
+            access_folders=access_folders,
+            k_per_doc=6,
+            max_total=12,
+            chunk_max_chars=1200,
+            debug=debug,
+        )
+        has_docs = bool(chunks)
+        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+
+        system_rules = (
+            "You are the ShipERP assistant.\n"
+            "You must answer FIRST using the documentation excerpts provided below.\n"
+            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+            "Only then, provide a general-knowledge answer.\n"
+            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+            "Be practical and sufficiently detailed to be useful.\n"
+            "Do NOT include any 'Sources' section in your answer."
+        )
+
+        messages = [{"role": "system", "content": system_rules}]
+        if summary:
+            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
+        messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
+        messages.extend(recent)
+
+        fast_force = should_escalate_fast(message, has_docs=has_docs)
+        triage = triage_route(
+            user_text=message,
+            mode="web_chat",
+            has_docs=has_docs,
+            context_hint=(f"Summary:\n{summary}\n\nRecent turns count: {len(recent)}") if summary else f"Recent turns count: {len(recent)}",
+        )
+
+        use_mini = (
+            (not fast_force)
+            and triage.get("route") == "mini"
+            and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
+        )
+        model = MODEL_MINI if use_mini else MODEL_BIG
+
+        answer = chat_completion(
+            model=model,
+            messages=messages,
+            max_completion_tokens=900,
+        )
+
+        fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
         if answer.lower().startswith(fallback_marker):
             final_answer = answer
             out_sources = []
@@ -697,15 +912,19 @@ def chat_ui():
     .user { font-weight: bold; }
     .assistant { font-weight: bold; }
     .bubble { padding: 10px; border-radius: 10px; display: inline-block; max-width: 90%; white-space: pre-wrap; }
-    .b-unew_summary = chat_completion(
-            model=MODEL_MINI,
-            messages=[
-                {"role": "system", "content": "You summarize chat history into a concise running memory."},
-                {"role": "user", "content": summary_prompt},
-            ],
-            max_completion_tokens=450,
-        )
-        state["summary"] =button onclick=\"newChat()\">New chat</button>
+    .b-user { background: #e8f0ff; }
+    .b-assistant { background: #e9ffe8; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+
+<h2>Conversation Bot (per user)</h2>
+<p class=\"muted\">Cette page est séparée du bot Slack/one-shot. La mémoire est en RAM (reset au restart).</p>
+
+<div class=\"row\">
+  <input id=\"user_id\" placeholder=\"user_id (ex: email ou username)\" />
+  <button onclick=\"newChat()\">New chat</button>
 </div>
 
 <div id=\"chat\"></div>
@@ -864,11 +1083,13 @@ async def startup_event():
 async def startup_sync():
     global sync_in_progress
     if sync_in_progress:
-        print("Startup sync skipanswer = chat_completion(
-            model=model,
-            messages=messages,
-            max_completion_tokens=900,
-        )arepoint)
+        print("Startup sync skipped: already in progress.")
+        return
+
+    sync_in_progress = True
+    try:
+        print("Running SharePoint sync on startup (background)...")
+        await asyncio.to_thread(sync_sharepoint)
         clear_index_cache()
         print("Startup sync finished.")
     except Exception as e:
