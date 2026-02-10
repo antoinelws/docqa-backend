@@ -649,9 +649,13 @@ def ask_question(
 
         answer = chat_completion(model=model, messages=messages, max_completion_tokens=700)
 
-        out_sources = sources if has_docs else []
-        if has_docs and out_sources:
-            answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+        fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
+        if answer.lower().startswith(fallback_marker):
+            out_sources = []
+        else:
+            out_sources = sources if has_docs else []
+            if has_docs and out_sources:
+                answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
 
         payload = {"answer": answer, "sources": out_sources}
         if debug:
