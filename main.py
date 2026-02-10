@@ -283,6 +283,16 @@ def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
             chunks = json.load(f)
 
         index = faiss.read_index(index_path)
+
+            # 1) Lexical scan boost: add exact keyword hits with best possible distance
+            if keywords:
+                for c in chunks_list:
+                    c_str = (c or "").strip()
+                    if not c_str:
+                        continue
+                    c_lc = c_str.lower()
+                    if any(k in c_lc for k in keywords):
+                        scored.append((-1.0, c_str, base))
         results.append((chunks, index))
 
     return results
@@ -508,9 +518,17 @@ def retrieve_chunks_with_sources(
       chunks: list[str] (deduped best chunks)
       sources: list[str] unique doc basenames (deduped, in order of first appearance)
     """
+    import re
+
     question = (question or "").strip()
     if not question:
         return [], []
+
+    # --- Keyword boost for acronyms / codes (e.g., SPDD, VL31N, Z* transactions) ---
+    # Vector search can miss short codes; we do a cheap lexical scan and boost exact hits.
+    upper_codes = [t for t in re.findall(r"[A-Za-z0-9_]{3,}", question) if t.isupper()]
+    lower_terms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]{3,}", question)]
+    keywords = list(dict.fromkeys(upper_codes + lower_terms))  # unique, stable order
 
     qvecs = embed_texts([question])
     if not qvecs:
@@ -614,23 +632,36 @@ def ask_question(
         )
 
         has_docs = bool(chunks)
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        docs_block = "
+---
+".join(chunks) if chunks else "(none found for this question)"
 
         system_rules = (
-            "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-            "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Be practical and sufficiently detailed to be useful.\n"
+            "You are the ShipERP assistant.
+"
+            "You must answer FIRST using the documentation excerpts provided below.
+"
+            "If the documentation contains relevant information, base your answer strictly on it.
+
+"
+            "If the documentation does NOT contain the answer, say explicitly:
+"
+            "\"The documentation does not mention this, but here is what I know from general knowledge:\"
+
+"
+            "Only then, provide a concise general-knowledge answer.
+"
+            "Do not mix documentation-based information and general knowledge in the same sentence.
+"
+            "Be practical and sufficiently detailed to be useful.
+"
             "Do NOT include any 'Sources' section in your answer."
         )
 
         messages = [
             {"role": "system", "content": system_rules},
-            {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+            {"role": "system", "content": f"Documentation excerpts:
+{docs_block}"},
             {"role": "user", "content": question},
         ]
 
@@ -656,10 +687,13 @@ def ask_question(
 
         # If docs exist but the model still outputs the fallback, force one retry on the big model.
         if has_docs and answer.lower().startswith(fallback_marker):
-            retry_rules = system_rules + "\n\nIMPORTANT: Relevant documentation IS provided above. Do NOT use the fallback sentence. Answer strictly from the excerpts."
+            retry_rules = system_rules + "
+
+IMPORTANT: Relevant documentation IS provided above. Do NOT use the fallback sentence. Answer strictly from the excerpts."
             retry_messages = [
                 {"role": "system", "content": retry_rules},
-                {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+                {"role": "system", "content": f"Documentation excerpts:
+{docs_block}"},
                 {"role": "user", "content": question},
             ]
             answer = chat_completion(model=MODEL_BIG, messages=retry_messages, max_completion_tokens=700)
@@ -670,7 +704,9 @@ def ask_question(
         else:
             out_sources = sources if has_docs else []
             if has_docs and out_sources:
-                answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+                answer = answer.rstrip() + "
+
+Sources: " + ", ".join(out_sources)
 
         payload: Dict[str, Any] = {"answer": answer, "sources": out_sources}
         if debug:
