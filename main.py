@@ -650,12 +650,33 @@ def ask_question(
         answer = chat_completion(model=model, messages=messages, max_completion_tokens=700)
 
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
+
+        # If we DO have docs, but the model still claims docs don't mention it,
+        # do one forced retry with the big model and stricter instruction.
+        if has_docs and answer.lower().startswith(fallback_marker):
+            retry_rules = (
+                system_rules
+                + "
+
+IMPORTANT: Relevant documentation IS provided above. "
+                + "Do NOT use the fallback sentence. Answer strictly from the excerpts."
+            )
+            retry_messages = [
+                {"role": "system", "content": retry_rules},
+                {"role": "system", "content": f"Documentation excerpts:
+{docs_block}"},
+                {"role": "user", "content": question},
+            ]
+            answer = chat_completion(model=MODEL_BIG, messages=retry_messages, max_completion_tokens=700)
+
         if answer.lower().startswith(fallback_marker):
             out_sources = []
         else:
             out_sources = sources if has_docs else []
             if has_docs and out_sources:
-                answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+                answer = answer.rstrip() + "
+
+Sources: " + ", ".join(out_sources)
 
         payload = {"answer": answer, "sources": out_sources}
         if debug:
