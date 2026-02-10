@@ -59,7 +59,18 @@ VECTOR_DIM = 3072
 SCOPES = ["https://graph.microsoft.com/.default"]
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
+PUBLIC_USER_FILE = "public_users.json"
 INTERNAL_USER_FILE = "internal_users.json"
+
+def _load_users(path: str) -> Dict[str, Any]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    return {}
+
+INTERNAL_USERS = _load_users(INTERNAL_USER_FILE)  # email -> true OR {"password_hash": "..."}
+PUBLIC_USERS = _load_users(PUBLIC_USER_FILE)      # email -> true OR {"password_hash": "..."}
+
 
 FALLBACK_MARKER = "the documentation does not mention this, but here is what i know from general knowledge:"
 
@@ -67,6 +78,42 @@ FALLBACK_MARKER = "the documentation does not mention this, but here is what i k
 # =========================
 # OpenAI helpers
 # =========================
+def is_allowed(users: Dict[str, Any], email: str) -> bool:
+    v = users.get(email)
+    if v is True:
+        return True
+    if isinstance(v, dict) and isinstance(v.get("password_hash"), str) and v["password_hash"].strip():
+        return True
+    return False
+
+def get_user_tier(email: str) -> Optional[str]:
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    if is_allowed(INTERNAL_USERS, email):
+        return "internal"
+    if is_allowed(PUBLIC_USERS, email):
+        return "public"
+    return None
+
+def get_password_hash(users: Dict[str, Any], email: str) -> Optional[str]:
+    v = users.get(email)
+    if isinstance(v, dict):
+        ph = v.get("password_hash")
+        if isinstance(ph, str) and ph.strip():
+            return ph.strip()
+    return None
+
+def verify_password(email: str, password: str) -> bool:
+    email = (email or "").strip().lower()
+    password = password or ""
+
+    rec_hash = get_password_hash(INTERNAL_USERS, email) or get_password_hash(PUBLIC_USERS, email)
+    if not rec_hash:
+        return False
+
+    return bcrypt.checkpw(password.encode("utf-8"), rec_hash.encode("utf-8"))
+
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
     """
     Minimal wrapper to avoid params that some endpoints reject.
@@ -341,6 +388,17 @@ else:
 # FastAPI
 # =========================
 app = FastAPI()
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+if not SESSION_SECRET:
+    raise RuntimeError("Missing SESSION_SECRET env var")
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    same_site="lax",
+    https_only=True,  # Render = HTTPS => True recommandé
+)
+
 app.include_router(estimator_router)
 
 app.add_middleware(
@@ -783,6 +841,7 @@ async def chat_api(
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
+
 def chat_ui():
     return """
 <!doctype html>
