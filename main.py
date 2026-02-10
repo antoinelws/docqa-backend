@@ -127,15 +127,15 @@ def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = 
         },
     }
 
-    raw = chat_completion(
-        model=MODEL_MINI,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        temperature=0.0,
-        max_completion_tokens=450,
-    )
+raw = chat_completion(
+    model=MODEL_MINI,
+    messages=[
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ],
+    max_completion_tokens=450,
+)
+
 
     try:
         data = json.loads(raw)
