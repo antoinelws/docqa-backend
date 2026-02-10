@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, List, Any, Tuple
-import re
+
 import requests
 import pdfplumber
 import docx
@@ -31,10 +31,9 @@ TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Option B: mini by default + escalate to 5.2 when needed
+# Models (Option B constants kept, routing can be re-added once stable)
 MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
 MODEL_BIG = os.getenv("OPENAI_MODEL_BIG", "gpt-5.2")
-TRIAGE_CONFIDENCE_THRESHOLD = float(os.getenv("TRIAGE_THRESHOLD", "0.82"))
 
 DRIVE_ID = "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT"
 FOLDER_PATH = "AI"
@@ -56,7 +55,7 @@ INTERNAL_USER_FILE = "internal_users.json"
 # OpenAI helpers
 # =========================
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
-    """OpenAI ChatCompletion wrapper for GPT-5.x (no temperature, uses max_completion_tokens)."""
+    """Minimal wrapper (avoid params that some GPT-5 endpoints reject)."""
     import openai
 
     openai.api_key = OPENAI_API_KEY
@@ -66,100 +65,6 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
         max_completion_tokens=max_completion_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
-
-
-def should_escalate_fast(text: str, has_docs: bool) -> bool:
-    """Cheap deterministic guardrail to force escalation on sensitive/complex signals."""
-    t = (text or "").strip().lower()
-    if not t:
-        return True
-
-    if len(t) > 700:
-        return True
-
-    keywords = [
-        "billing", "invoice", "pricing", "price", "cost", "facturation", "devis",
-        "security", "sécurité", "apikey", "api key", "token", "secret", "credential",
-        "rgpd", "gdpr", "contract", "contrat", "legal", "juridique",
-        "delete", "remove", "drop", "purge", "irreversible", "production",
-    ]
-    if any(k in t for k in keywords):
-        return True
-
-    if not has_docs and any(x in t for x in ["how", "why", "comment", "pourquoi", "explain", "explique"]):
-        return True
-
-    return False
-
-
-def triage_route(user_text: str, mode: str, has_docs: bool, context_hint: str = "") -> dict:
-    """Triage using MODEL_MINI returning strict JSON. If invalid JSON → escalate."""
-    user_text = (user_text or "").strip()
-
-    system = (
-        "You are a routing classifier for an assistant.\n"
-        "Decide if the request can be answered safely and correctly by a small/cheap model "
-        "or if it must be escalated to a high-quality model.\n"
-        "Return ONLY valid JSON with the exact keys specified.\n\n"
-        "Escalate if:\n"
-        "- confidence is low\n"
-        "- request is multi-step, ambiguous, or requires careful reasoning\n"
-        "- request is sensitive (security, credentials, billing, legal, irreversible actions)\n"
-        "- answer requires long structured output or high precision\n"
-        "- documentation is missing/unclear and the user expects correctness\n"
-    )
-
-    payload = {
-        "mode": mode,
-        "has_docs": has_docs,
-        "context_hint": (context_hint or "")[:1500],
-        "user_message": user_text[:5000],
-        "output_schema": {
-            "route": "mini|escalate",
-            "confidence": "0.0-1.0",
-            "answer_draft": "string (only if route=mini)",
-            "handoff": {
-                "summary": "string",
-                "key_facts": "array of strings",
-                "open_questions": "array of strings",
-            },
-        },
-    }
-
-    raw = chat_completion(
-        model=MODEL_MINI,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        max_completion_tokens=450,
-    )
-
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {
-            "route": "escalate",
-            "confidence": 0.0,
-            "answer_draft": "",
-            "handoff": {"summary": "", "key_facts": [], "open_questions": []},
-        }
-
-    route = (data.get("route") or "").strip().lower()
-    conf = data.get("confidence", 0.0)
-    try:
-        conf = float(conf)
-    except Exception:
-        conf = 0.0
-
-    if route not in ("mini", "escalate"):
-        route = "escalate"
-
-    data["route"] = route
-    data["confidence"] = conf
-    if "handoff" not in data or not isinstance(data["handoff"], dict):
-        data["handoff"] = {"summary": "", "key_facts": [], "open_questions": []}
-    return data
 
 
 # =========================
@@ -189,14 +94,16 @@ def extract_text(filename: str, content: bytes) -> str:
             tmp.write(content)
             tmp.flush()
             with pdfplumber.open(tmp.name) as pdf:
-                return "\n".join(page.extract_text() or "" for page in pdf.pages)
+                return "
+".join(page.extract_text() or "" for page in pdf.pages)
 
     if ext == "docx":
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(content)
             tmp.flush()
             doc = docx.Document(tmp.name)
-            return "\n".join(p.text for p in doc.paragraphs)
+            return "
+".join(p.text for p in doc.paragraphs)
 
     if ext == "txt":
         try:
@@ -283,16 +190,6 @@ def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
             chunks = json.load(f)
 
         index = faiss.read_index(index_path)
-
-            # 1) Lexical scan boost: add exact keyword hits with best possible distance
-            if keywords:
-                for c in chunks_list:
-                    c_str = (c or "").strip()
-                    if not c_str:
-                        continue
-                    c_lc = c_str.lower()
-                    if any(k in c_lc for k in keywords):
-                        scored.append((-1.0, c_str, base))
         results.append((chunks, index))
 
     return results
@@ -334,7 +231,8 @@ def clear_index_cache():
 def log_sync_activity(filename: str, user_name: str, user_email: str):
     ts = datetime.datetime.utcnow().isoformat()
     with open(HISTORY_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{ts},{filename},{user_name},{user_email}\n")
+        f.write(f"{ts},{filename},{user_name},{user_email}
+")
 
 
 def sync_sharepoint():
@@ -513,23 +411,12 @@ def retrieve_chunks_with_sources(
     chunk_max_chars: int = 1200,
     debug: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """Retrieve best-matching documentation chunks and their source doc names.
-
-    Notes:
-    - Vector search can miss short codes/acronyms (e.g., SPDD, VL31N). We add a cheap lexical boost:
-      any chunk containing a query keyword gets a best distance (-1.0) so it ranks first.
-    """
-
-    q = (question or "").strip()
-    if not q:
+    """Return best chunks + unique source doc basenames."""
+    question = (question or "").strip()
+    if not question:
         return [], []
 
-    # Build keywords for lexical boost
-    tokens = re.findall(r"[A-Za-z0-9_]{3,}", q)
-    upper_codes = [t for t in tokens if t.isupper()]
-    keywords = list(dict.fromkeys(upper_codes + [t.lower() for t in tokens]))
-
-    qvecs = embed_texts([q])
+    qvecs = embed_texts([question])
     if not qvecs:
         return [], []
     qvec = qvecs[0]
@@ -537,7 +424,8 @@ def retrieve_chunks_with_sources(
     scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
 
     for folder in access_folders:
-        for json_path in glob.glob(f"{folder}/*.json"):
+        json_paths = glob.glob(f"{folder}/*.json")
+        for json_path in json_paths:
             base = os.path.splitext(os.path.basename(json_path))[0]
             index_path = os.path.join(folder, f"{base}.index")
             if not os.path.exists(index_path):
@@ -552,17 +440,6 @@ def retrieve_chunks_with_sources(
                     print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
                 continue
 
-            # Lexical boost (exact contains)
-            if keywords:
-                for c in chunks_list:
-                    c_str = (c or "").strip()
-                    if not c_str:
-                        continue
-                    c_lc = c_str.lower()
-                    if any(k in c_lc for k in keywords):
-                        scored.append((-1.0, c_str, base))
-
-            # Vector search
             D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
             for dist, idx in zip(D[0], I[0]):
                 if 0 <= idx < len(chunks_list):
@@ -573,7 +450,7 @@ def retrieve_chunks_with_sources(
     if not scored:
         return [], []
 
-    scored.sort(key=lambda x: x[0])  # smaller = better; lexical boosted are -1
+    scored.sort(key=lambda x: x[0])
 
     seen_chunks = set()
     chunks: List[str] = []
@@ -601,7 +478,7 @@ def retrieve_chunks_with_sources(
             uniq_sources.append(s)
 
     if debug:
-        print("[RAG][DEBUG] question:", q)
+        print("[RAG][DEBUG] question:", question)
         print("[RAG][DEBUG] access_folders:", access_folders)
         print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
 
@@ -609,7 +486,7 @@ def retrieve_chunks_with_sources(
 
 
 # =========================
-# One-shot QA (/ask) - docs-first + fallback + Option B routing
+# One-shot QA (/ask) - docs-first + fallback (stable)
 # =========================
 @app.post("/ask")
 def ask_question(
@@ -628,7 +505,6 @@ def ask_question(
         elif INTERNAL_USERS.get(user_email):
             access_folders.append("documents/internal")
 
-        # Retrieve
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
             access_folders=access_folders,
@@ -653,9 +529,9 @@ def ask_question(
 "
             "If the documentation does NOT contain the answer, say explicitly:
 "
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"
+            '"The documentation does not mention this, but here is what I know from general knowledge:"
 
-"
+'
             "Only then, provide a concise general-knowledge answer.
 "
             "Do not mix documentation-based information and general knowledge in the same sentence.
@@ -672,40 +548,11 @@ def ask_question(
             {"role": "user", "content": question},
         ]
 
-        # Option B routing: mini by default, escalate to big when needed
-        fast_force = should_escalate_fast(question, has_docs=has_docs)
-        triage = triage_route(
-            user_text=question,
-            mode="slack_one_shot",
-            has_docs=has_docs,
-            context_hint="One-shot question. Docs excerpts provided." if has_docs else "One-shot question. No docs found.",
-        )
+        # Keep stable: use big model for now
+        answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
-        use_mini = (
-            (not fast_force)
-            and triage.get("route") == "mini"
-            and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
-        )
-        model = MODEL_MINI if use_mini else MODEL_BIG
-
-        answer = chat_completion(model=model, messages=messages, max_completion_tokens=700)
-
+        # Sources logic: only attach sources if answer is docs-based (no fallback)
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
-
-        # If docs exist but the model still outputs the fallback, force one retry on the big model.
-        if has_docs and answer.lower().startswith(fallback_marker):
-            retry_rules = system_rules + "
-
-IMPORTANT: Relevant documentation IS provided above. Do NOT use the fallback sentence. Answer strictly from the excerpts."
-            retry_messages = [
-                {"role": "system", "content": retry_rules},
-                {"role": "system", "content": f"Documentation excerpts:
-{docs_block}"},
-                {"role": "user", "content": question},
-            ]
-            answer = chat_completion(model=MODEL_BIG, messages=retry_messages, max_completion_tokens=700)
-
-        # Sources logic (match /chat-api): only attach sources when answer is docs-based
         if answer.lower().startswith(fallback_marker):
             out_sources: List[str] = []
         else:
@@ -717,12 +564,8 @@ Sources: " + ", ".join(out_sources)
 
         payload: Dict[str, Any] = {"answer": answer, "sources": out_sources}
         if debug:
-            payload["routed_model"] = model
-            payload["triage"] = triage
-            payload["fast_force_escalate"] = fast_force
-            payload["threshold"] = TRIAGE_CONFIDENCE_THRESHOLD
             payload["has_docs"] = has_docs
-            payload["models"] = {"mini": MODEL_MINI, "big": MODEL_BIG}
+            payload["model"] = MODEL_BIG
 
         return payload
 
@@ -731,12 +574,14 @@ Sources: " + ", ".join(out_sources)
 
 
 # =========================
-# Conversation (per-user) + RAG + Option B routing
+# Conversation (per-user) + RAG
 # =========================
+CHAT_MODEL = MODEL_BIG
 CHAT_MAX_TURNS = 12
 CHAT_SUMMARY_TRIGGER = 18
 CHAT_CONTEXT_CHAR_BUDGET = 14000
 
+# In-memory store (resets on restart)
 CHAT_STORE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -774,7 +619,8 @@ def _summarize_if_needed(user_id: str):
 
     keep = msgs[-CHAT_MAX_TURNS:]
     old = msgs[:-CHAT_MAX_TURNS]
-    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+    old_text = "
+".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
 
     if not old_text.strip():
         state["messages"] = keep
@@ -814,6 +660,8 @@ async def chat_api(
     debug: bool = Form(False),
 ):
     try:
+        import re
+
         user_id = (user_id or "").strip()
         message = (message or "").strip()
 
@@ -836,20 +684,20 @@ async def chat_api(
 
         def is_chat_memory_question(s: str) -> bool:
             patterns = [
-                r"\bfirst question\b",
-                r"\bmy first question\b",
-                r"\bwhat was i asking\b",
-                r"\bwhat did i ask\b",
-                r"\bearlier\b.*\b(chat|conversation)\b",
-                r"\bin this chat\b",
-                r"\bin this conversation\b",
-                r"\bwhat did you say\b",
-                r"\bwhat did i say\b",
-                r"\bwhat have we discussed\b",
-                r"\brappelle\b.*\b(premi|première)\b.*\bquestion\b",
-                r"\bc'était quoi\b.*\bma\b.*\b(premi|première)\b.*\bquestion\b",
-                r"\bdans ce chat\b",
-                r"\bdans cette conversation\b",
+                r"first question",
+                r"my first question",
+                r"what was i asking",
+                r"what did i ask",
+                r"earlier.*(chat|conversation)",
+                r"in this chat",
+                r"in this conversation",
+                r"what did you say",
+                r"what did i say",
+                r"what have we discussed",
+                r"rappelle.*(premi|première).*question",
+                r"c'était quoi.*ma.*(premi|première).*question",
+                r"dans ce chat",
+                r"dans cette conversation",
             ]
             return any(re.search(p, s) for p in patterns)
 
@@ -884,46 +732,41 @@ async def chat_api(
             debug=debug,
         )
         has_docs = bool(chunks)
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        docs_block = "
+---
+".join(chunks) if chunks else "(none found for this question)"
 
         system_rules = (
-            "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-            "Only then, provide a general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Be practical and sufficiently detailed to be useful.\n"
+            "You are the ShipERP assistant.
+"
+            "You must answer FIRST using the documentation excerpts provided below.
+"
+            "If the documentation contains relevant information, base your answer strictly on it.
+
+"
+            "If the documentation does NOT contain the answer, say explicitly:
+"
+            '"The documentation does not mention this, but here is what I know from general knowledge:"
+
+'
+            "Only then, provide a general-knowledge answer.
+"
+            "Do not mix documentation-based information and general knowledge in the same sentence.
+"
+            "Be practical and sufficiently detailed to be useful.
+"
             "Do NOT include any 'Sources' section in your answer."
         )
 
         messages = [{"role": "system", "content": system_rules}]
         if summary:
-            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
-        messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
+            messages.append({"role": "system", "content": f"Conversation memory (summary):
+{summary}"})
+        messages.append({"role": "system", "content": f"Documentation excerpts:
+{docs_block}"})
         messages.extend(recent)
 
-        fast_force = should_escalate_fast(message, has_docs=has_docs)
-        triage = triage_route(
-            user_text=message,
-            mode="web_chat",
-            has_docs=has_docs,
-            context_hint=(f"Summary:\n{summary}\n\nRecent turns count: {len(recent)}") if summary else f"Recent turns count: {len(recent)}",
-        )
-
-        use_mini = (
-            (not fast_force)
-            and triage.get("route") == "mini"
-            and float(triage.get("confidence", 0.0)) >= TRIAGE_CONFIDENCE_THRESHOLD
-        )
-        model = MODEL_MINI if use_mini else MODEL_BIG
-
-        answer = chat_completion(
-            model=model,
-            messages=messages,
-            max_completion_tokens=900,
-        )
+        answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
         fallback_marker = "the documentation does not mention this, but here is what i know from general knowledge:"
         if answer.lower().startswith(fallback_marker):
@@ -932,7 +775,9 @@ async def chat_api(
         else:
             out_sources = uniq_sources if has_docs else []
             if out_sources:
-                final_answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
+                final_answer = answer.rstrip() + "
+
+Sources: " + ", ".join(out_sources)
             else:
                 final_answer = answer
 
@@ -941,16 +786,7 @@ async def chat_api(
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
-        payload = {"answer": final_answer, "user_id": user_id, "sources": out_sources}
-        if debug:
-            payload["routed_model"] = model
-            payload["triage"] = triage
-            payload["fast_force_escalate"] = fast_force
-            payload["threshold"] = TRIAGE_CONFIDENCE_THRESHOLD
-            payload["has_docs"] = has_docs
-            payload["models"] = {"mini": MODEL_MINI, "big": MODEL_BIG}
-
-        return payload
+        return {"answer": final_answer, "user_id": user_id, "sources": out_sources}
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
