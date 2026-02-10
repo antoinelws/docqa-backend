@@ -513,22 +513,23 @@ def retrieve_chunks_with_sources(
     chunk_max_chars: int = 1200,
     debug: bool = False,
 ) -> Tuple[List[str], List[str]]:
+    """Retrieve best-matching documentation chunks and their source doc names.
+
+    Notes:
+    - Vector search can miss short codes/acronyms (e.g., SPDD, VL31N). We add a cheap lexical boost:
+      any chunk containing a query keyword gets a best distance (-1.0) so it ranks first.
     """
-    Returns:
-      chunks: list[str] (deduped best chunks)
-      sources: list[str] unique doc basenames (deduped, in order of first appearance)
-    """
-    question = (question or "").strip()
-    if not question:
+
+    q = (question or "").strip()
+    if not q:
         return [], []
 
-    # --- Keyword boost for acronyms / codes (e.g., SPDD, VL31N, Z* transactions) ---
-    # Vector search can miss short codes; we do a cheap lexical scan and boost exact hits.
-    upper_codes = [t for t in re.findall(r"[A-Za-z0-9_]{3,}", question) if t.isupper()]
-    lower_terms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]{3,}", question)]
-    keywords = list(dict.fromkeys(upper_codes + lower_terms))  # unique, stable order
+    # Build keywords for lexical boost
+    tokens = re.findall(r"[A-Za-z0-9_]{3,}", q)
+    upper_codes = [t for t in tokens if t.isupper()]
+    keywords = list(dict.fromkeys(upper_codes + [t.lower() for t in tokens]))
 
-    qvecs = embed_texts([question])
+    qvecs = embed_texts([q])
     if not qvecs:
         return [], []
     qvec = qvecs[0]
@@ -536,8 +537,7 @@ def retrieve_chunks_with_sources(
     scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
 
     for folder in access_folders:
-        json_paths = glob.glob(f"{folder}/*.json")
-        for json_path in json_paths:
+        for json_path in glob.glob(f"{folder}/*.json"):
             base = os.path.splitext(os.path.basename(json_path))[0]
             index_path = os.path.join(folder, f"{base}.index")
             if not os.path.exists(index_path):
@@ -552,6 +552,17 @@ def retrieve_chunks_with_sources(
                     print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
                 continue
 
+            # Lexical boost (exact contains)
+            if keywords:
+                for c in chunks_list:
+                    c_str = (c or "").strip()
+                    if not c_str:
+                        continue
+                    c_lc = c_str.lower()
+                    if any(k in c_lc for k in keywords):
+                        scored.append((-1.0, c_str, base))
+
+            # Vector search
             D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
             for dist, idx in zip(D[0], I[0]):
                 if 0 <= idx < len(chunks_list):
@@ -562,7 +573,7 @@ def retrieve_chunks_with_sources(
     if not scored:
         return [], []
 
-    scored.sort(key=lambda x: x[0])  # smaller = better
+    scored.sort(key=lambda x: x[0])  # smaller = better; lexical boosted are -1
 
     seen_chunks = set()
     chunks: List[str] = []
@@ -590,11 +601,9 @@ def retrieve_chunks_with_sources(
             uniq_sources.append(s)
 
     if debug:
-        print("[RAG][DEBUG] question:", question)
+        print("[RAG][DEBUG] question:", q)
         print("[RAG][DEBUG] access_folders:", access_folders)
         print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
-        for i, c in enumerate(chunks[:6], start=1):
-            print(f"[RAG][DEBUG] chunk#{i}:", c.replace("\n", " ")[:240])
 
     return chunks, uniq_sources
 
