@@ -1071,8 +1071,19 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
 # =========================
 @app.on_event("startup")
 async def startup_event():
-    print("Startup complete (sync disabled temporarily).")
+    async def _run():
+        try:
+            print("Running SharePoint sync on startup (background)...")
+            await asyncio.to_thread(sync_sharepoint)
+            clear_index_cache()
+            print("Startup sync finished.")
+        except Exception as e:
+            import traceback
+            print("Startup sync failed:", repr(e))
+            traceback.print_exc()
 
+    asyncio.create_task(_run())
+    print("Startup complete (sync scheduled).")
 
 
 async def startup_sync():
