@@ -1071,7 +1071,8 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
 # =========================
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(startup_sync())
+    print("Startup complete (sync disabled temporarily).")
+
 
 
 async def startup_sync():
