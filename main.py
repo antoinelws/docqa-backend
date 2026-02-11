@@ -531,40 +531,45 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     try:
-        filename = file.filename
-        document_name = os.path.splitext(filename)[0]
+        filename = file.filename or "document"
+        document_name = os.path.splitext(filename)[0] or "document"
 
         content = await file.read()
         text = extract_text(filename, content)
         chunks = chunk_text(text)
         if not chunks:
-            return {"error": "No text extracted from uploaded file."}
+            return JSONResponse({"error": "No text extracted from uploaded file."}, status_code=400)
 
         vectors = embed_texts(chunks)
         if not vectors:
-            return {"error": "No valid text to embed in this document."}
+            return JSONResponse({"error": "No valid text to embed in this document."}, status_code=400)
 
-        # IMPORTANT:
-        # If upload is meant to be "user-private", we should NOT write to documents/public.
-        # Minimal safe choice: write to a per-user folder.
-        safe_email = email.replace("@", "_at_").replace(".", "_")
+        # Private per-user folder
+        safe_email = (
+            email.replace("@", "_at_")
+                 .replace(".", "_")
+                 .replace("/", "_")
+                 .replace("\\", "_")
+        )
         subfolder = Path(DESTINATION_FOLDER) / "uploads" / safe_email
         subfolder.mkdir(parents=True, exist_ok=True)
 
-        with open(subfolder / f"{document_name}.json", "w", encoding="utf-8") as f:
+        json_path = subfolder / f"{document_name}.json"
+        index_path = subfolder / f"{document_name}.index"
+
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
 
         index = faiss.IndexFlatL2(VECTOR_DIM)
         index.add(np.array(vectors).astype("float32"))
-        faiss.write_index(index, str(subfolder / f"{document_name}.index"))
+        faiss.write_index(index, str(index_path))
 
         clear_index_cache()
-        return {"message": f"Document '{document_name}' uploaded for user {email}."}
+        return {"message": f"Document '{document_name}' uploaded privately for {email}."}
 
     except Exception as e:
         print("Upload failed:", str(e))
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 # =========================
 # Sync now (background)
@@ -688,15 +693,23 @@ def ask_question(
         user_email = (user_email or "").strip()
 
         # Access control
-        tier = get_user_tier(user_email)
-        if tier == "internal":
-            access_folders = ["documents/public", "documents/internal"]
-        elif tier == "public":
-            access_folders = ["documents/public"]
-        else:
-            # deny-by-default
-            return JSONResponse({"error": "Access denied"}, status_code=403)
+       tier = get_user_tier(user_email)
+        email_lc = (user_email or "").strip().lower()
+        
+        safe_email = (
+            email_lc.replace("@", "_at_")
+                    .replace(".", "_")
+                    .replace("/", "_")
+                    .replace("\\", "_")
+        )
+        user_upload_folder = f"documents/uploads/{safe_email}"
 
+if tier == "internal":
+    access_folders = ["documents/public", "documents/internal", user_upload_folder]
+elif tier == "public":
+    access_folders = ["documents/public", user_upload_folder]
+else:
+    return JSONResponse({"error": "Access denied"}, status_code=403)
 
 
         chunks, sources = retrieve_chunks_with_sources(
@@ -854,7 +867,7 @@ async def chat_api(
              .replace("\\", "_")
     )
     user_upload_folder = f"documents/uploads/{safe_email}"
-
+    
     if tier == "internal":
         access_folders = ["documents/public", "documents/internal", user_upload_folder]
     elif tier == "public":
@@ -982,7 +995,7 @@ def chat_ui(request: Request):
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Conversation Bot (Per User)</title>
+  <title>ShipERP AI Bot</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
@@ -990,23 +1003,28 @@ def chat_ui(request: Request):
     textarea { width: 100%; height: 90px; }
     #chat { border: 1px solid #ddd; padding: 12px; border-radius: 8px; height: 420px; overflow: auto; background: #fafafa; }
     .msg { margin: 10px 0; }
-    .user { font-weight: bold; }
-    .assistant { font-weight: bold; }
     .bubble { padding: 10px; border-radius: 10px; display: inline-block; max-width: 90%; white-space: pre-wrap; }
     .b-user { background: #e8f0ff; }
     .b-assistant { background: #e9ffe8; }
-    .muted { color: #666; font-size: 12px; }
+    .upload-box { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background:#f9f9f9; }
   </style>
 </head>
 <body>
 
-<h2>Conversation Bot (per user)</h2>
-<p class="muted">Mémoire en RAM (reset au restart). User: <b>__USER_ID__</b></p>
+<h2>ShipERP AI Bot</h2>
+<p>User: <b>__USER_ID__</b></p>
+
+<div class="upload-box">
+  <h3>Upload a Document (private to you)</h3>
+  <input type="file" id="fileInput" />
+  <button onclick="uploadFile()">Upload</button>
+  <span id="uploadStatus"></span>
+</div>
 
 <div id="chat"></div>
 
 <div style="margin-top: 12px;">
-  <textarea id="msg" placeholder="Tape ton message..."></textarea>
+  <textarea id="msg" placeholder="Type your message..."></textarea>
   <div style="margin-top: 10px;">
     <button onclick="send()">Send</button>
     <form method="post" action="/logout" style="display:inline;">
@@ -1016,29 +1034,18 @@ def chat_ui(request: Request):
 </div>
 
 <script>
-  const USER_ID = "__USER_ID__";
   const chatEl = document.getElementById('chat');
   const msgEl = document.getElementById('msg');
 
   function append(role, text) {
     const div = document.createElement('div');
     div.className = 'msg';
-    const who = document.createElement('div');
-    who.className = role === 'user' ? 'user' : 'assistant';
-    who.textContent = role === 'user' ? 'You' : 'Bot';
     const bubble = document.createElement('div');
     bubble.className = 'bubble ' + (role === 'user' ? 'b-user' : 'b-assistant');
     bubble.textContent = text;
-    div.appendChild(who);
     div.appendChild(bubble);
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
-  }
-
-  function newChat() {
-    chatEl.innerHTML = '';
-    msgEl.value = '';
-    append('assistant', 'Nouvelle conversation. Envoie un message.');
   }
 
   async function send() {
@@ -1061,13 +1068,38 @@ def chat_ui(request: Request):
     }
   }
 
-  newChat();
+  async function uploadFile() {
+    const fileInput = document.getElementById("fileInput");
+    const status = document.getElementById("uploadStatus");
+
+    if (!fileInput.files || !fileInput.files[0]) {
+      status.textContent = "Select a file first.";
+      return;
+    }
+
+    status.textContent = "Uploading...";
+
+    const form = new FormData();
+    form.append("file", fileInput.files[0]);
+
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+      status.textContent = "Uploaded successfully.";
+    } catch (e) {
+      status.textContent = "ERROR: " + e.message;
+    }
+  }
+
+  append('assistant', 'Welcome. You can upload a document and ask questions about it.');
 </script>
 
 </body>
 </html>
 """
     return HTMLResponse(html.replace("__USER_ID__", email))
+
 
 
 # =========================
