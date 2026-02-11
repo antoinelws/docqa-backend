@@ -518,7 +518,13 @@ sync_in_progress = False
 # Upload (public)
 # =========================
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    # Require logged-in session
+    email = (request.session.get("user_email") or "").strip().lower()
+    tier = get_user_tier(email)
+    if not tier:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     try:
         filename = file.filename
         document_name = os.path.splitext(filename)[0]
@@ -533,7 +539,11 @@ async def upload_file(file: UploadFile = File(...)):
         if not vectors:
             return {"error": "No valid text to embed in this document."}
 
-        subfolder = Path(DESTINATION_FOLDER) / "public"
+        # IMPORTANT:
+        # If upload is meant to be "user-private", we should NOT write to documents/public.
+        # Minimal safe choice: write to a per-user folder.
+        safe_email = email.replace("@", "_at_").replace(".", "_")
+        subfolder = Path(DESTINATION_FOLDER) / "uploads" / safe_email
         subfolder.mkdir(parents=True, exist_ok=True)
 
         with open(subfolder / f"{document_name}.json", "w", encoding="utf-8") as f:
@@ -544,10 +554,11 @@ async def upload_file(file: UploadFile = File(...)):
         faiss.write_index(index, str(subfolder / f"{document_name}.index"))
 
         clear_index_cache()
-        return {"message": f"Document '{document_name}' uploaded and processed."}
+        return {"message": f"Document '{document_name}' uploaded for user {email}."}
+
     except Exception as e:
         print("Upload failed:", str(e))
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =========================
