@@ -841,10 +841,19 @@ async def chat_api(
 
     user_id = email
 
+    # ---- include per-user uploads folder ----
+    safe_email = (
+        email.replace("@", "_at_")
+             .replace(".", "_")
+             .replace("/", "_")
+             .replace("\\", "_")
+    )
+    user_upload_folder = f"documents/uploads/{safe_email}"
+
     if tier == "internal":
-        access_folders = ["documents/public", "documents/internal"]
+        access_folders = ["documents/public", "documents/internal", user_upload_folder]
     elif tier == "public":
-        access_folders = ["documents/public"]
+        access_folders = ["documents/public", user_upload_folder]
     else:
         return JSONResponse({"error": "Access denied"}, status_code=403)
 
