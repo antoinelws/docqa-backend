@@ -690,12 +690,12 @@ def ask_question(
 ):
     try:
         question = (question or "").strip()
-        user_email = (user_email or "").strip()
-
-        # Access control
-       tier = get_user_tier(user_email)
         email_lc = (user_email or "").strip().lower()
-        
+
+        tier = get_user_tier(email_lc)
+        if not tier:
+            return JSONResponse({"error": "Access denied"}, status_code=403)
+
         safe_email = (
             email_lc.replace("@", "_at_")
                     .replace(".", "_")
@@ -704,13 +704,12 @@ def ask_question(
         )
         user_upload_folder = f"documents/uploads/{safe_email}"
 
-if tier == "internal":
-    access_folders = ["documents/public", "documents/internal", user_upload_folder]
-elif tier == "public":
-    access_folders = ["documents/public", user_upload_folder]
-else:
-    return JSONResponse({"error": "Access denied"}, status_code=403)
-
+        if tier == "internal":
+            access_folders = ["documents/public", "documents/internal", user_upload_folder]
+        elif tier == "public":
+            access_folders = ["documents/public", user_upload_folder]
+        else:
+            return JSONResponse({"error": "Access denied"}, status_code=403)
 
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
@@ -742,29 +741,25 @@ else:
             {"role": "user", "content": question},
         ]
 
-        # Stable: big model for now
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
-        # Sources logic: only attach sources if answer is docs-based (no fallback)
         if answer.lower().startswith(FALLBACK_MARKER):
-            out_sources: List[str] = []
-            final_answer = answer
-        else:
-            out_sources = sources if has_docs else []
-            if out_sources:
-                final_answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
-            else:
-                final_answer = answer
+            return {"answer": answer, "sources": []}
+
+        out_sources = sources if has_docs else []
+        final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
 
         payload: Dict[str, Any] = {"answer": final_answer, "sources": out_sources}
         if debug:
             payload["has_docs"] = has_docs
             payload["model"] = MODEL_BIG
+            payload["tier"] = tier
+            payload["user_upload_folder"] = user_upload_folder
 
         return payload
 
     except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =========================
