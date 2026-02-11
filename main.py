@@ -410,9 +410,10 @@ if not SESSION_SECRET:
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
-    same_site="lax",
-    https_only=True,  # Render = HTTPS => True recommandé
+    same_site="none",
+    https_only=True,
 )
+
 
 @app.post("/auth/login")
 def auth_login(email: str = Form(...), password: str = Form(...)):
