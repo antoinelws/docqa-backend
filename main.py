@@ -2,6 +2,8 @@ import os, json, glob, asyncio, datetime, tempfile
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, Any, Optional, List, Tuple
+from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks, HTTPException
+
 
 import bcrypt
 import requests
@@ -14,7 +16,6 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 
-from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -1142,19 +1143,4 @@ async def startup_event():
     print("Startup complete (sync scheduled).")
 
 
-async def startup_sync():
-    global sync_in_progress
-    if sync_in_progress:
-        print("Startup sync skipped: already in progress.")
-        return
 
-    sync_in_progress = True
-    try:
-        print("Running SharePoint sync on startup (background)...")
-        await asyncio.to_thread(sync_sharepoint)
-        clear_index_cache()
-        print("Startup sync finished.")
-    except Exception as e:
-        print(f"Startup sync failed: {e}")
-    finally:
-        sync_in_progress = False
