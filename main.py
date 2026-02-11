@@ -505,11 +505,15 @@ app.include_router(estimator_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
+        # si tu as un domaine custom plus tard, ajoute-le ici aussi
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 sync_in_progress = False
 
