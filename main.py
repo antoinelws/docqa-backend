@@ -9,6 +9,8 @@ import pdfplumber
 import docx
 import faiss
 import numpy as np
+
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 
@@ -120,6 +122,34 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
         max_completion_tokens=max_completion_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
+
+# =========================
+# Auth / Login (SSO helpers)
+# =========================
+SSO_SECRET = os.getenv("SSO_SECRET", "")
+if not SSO_SECRET:
+    raise RuntimeError("Missing SSO_SECRET env var")
+
+_sso = URLSafeTimedSerializer(SSO_SECRET, salt="docqa-sso-v1")
+
+def issue_sso_token(email: str) -> str:
+    email = (email or "").strip().lower()
+    tier = get_user_tier(email)
+    if not tier:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return _sso.dumps({"email": email})
+
+def verify_sso_token(token: str, max_age_seconds: int = 300) -> Dict[str, Any]:
+    try:
+        data = _sso.loads(token, max_age=max_age_seconds)
+        if not isinstance(data, dict) or not data.get("email"):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return data
+    except SignatureExpired:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except BadSignature:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 
 
 # =========================
@@ -382,6 +412,32 @@ app.add_middleware(
     same_site="lax",
     https_only=True,  # Render = HTTPS => True recommandé
 )
+
+@app.post("/auth/login")
+def auth_login(email: str = Form(...), password: str = Form(...)):
+    email_lc = (email or "").strip().lower()
+
+    if not get_user_tier(email_lc):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+
+    if not verify_password(email_lc, password or ""):
+        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+
+    token = issue_sso_token(email_lc)
+    return {"token": token, "email": email_lc}
+
+
+@app.get("/sso")
+def sso_entry(request: Request, token: str):
+    data = verify_sso_token(token, max_age_seconds=300)
+    email = (data.get("email") or "").strip().lower()
+
+    if not get_user_tier(email):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+
+    request.session["user_email"] = email
+    return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
+
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
