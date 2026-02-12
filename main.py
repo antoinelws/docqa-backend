@@ -429,91 +429,90 @@ def auth_login(email: str = Form(...), password: str = Form(...)):
     return {"token": token, "email": email_lc}
 
 
+from urllib.parse import urlparse
+
+FRONTEND_ORIGINS = [
+    "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
+]
+
+def _is_allowed_next(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        if u.scheme != "https":
+            return False
+        origin = f"{u.scheme}://{u.netloc}"
+        return origin in FRONTEND_ORIGINS
+    except Exception:
+        return False
+
+from fastapi import Query
+from urllib.parse import urlparse
+
+FRONTEND_ORIGINS = [
+    "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
+    # plus tard: "https://portal.shiperp.com",
+]
+
+def _is_allowed_next(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        if u.scheme != "https":
+            return False
+        origin = f"{u.scheme}://{u.netloc}"
+        return origin in FRONTEND_ORIGINS
+    except Exception:
+        return False
+
 @app.get("/sso")
-def sso_entry(request: Request, token: str):
+def sso_entry(
+    request: Request,
+    token: str,
+    next_url: str = Query(..., alias="next"),
+):
     data = verify_sso_token(token, max_age_seconds=300)
     email = (data.get("email") or "").strip().lower()
 
     if not get_user_tier(email):
         return JSONResponse({"error": "Access denied"}, status_code=403)
 
+    if not next_url or not _is_allowed_next(next_url):
+        return JSONResponse({"error": "Invalid next URL"}, status_code=400)
+
     request.session["user_email"] = email
-    return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=next_url, status_code=HTTP_303_SEE_OTHER)
 
 
-@app.get("/", response_class=HTMLResponse)
-def root(request: Request):
-    email = (request.session.get("user_email") or "").strip().lower()
-    if get_user_tier(email):
-        return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
-    return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
 
-@app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Login - ShipERP AI</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 520px; }
-    input, button { font-size: 14px; padding: 10px; width: 100%; margin-top: 10px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
-    .muted { color: #666; font-size: 12px; margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>ShipERP AI Assistant</h2>
-    <form method="post" action="/login">
-      <input name="email" placeholder="Email" autocomplete="username" required />
-      <input name="password" placeholder="Password" type="password" autocomplete="current-password" required />
-      <button type="submit">Sign in</button>
-    </form>
-    <div class="muted">Access is restricted to authorized users.</div>
-  </div>
-</body>
-</html>
-"""
-
-
-@app.post("/login")
-def login(request: Request, email: str = Form(...), password: str = Form(...)):
-    email_lc = (email or "").strip().lower()
-
-    # deny-by-default
-    if not get_user_tier(email_lc):
-        return HTMLResponse("<p>Access denied.</p><p><a href='/login'>Back</a></p>", status_code=403)
-
-    # vrai login: nécessite password_hash (un user en "true" ne peut pas se logguer tant que pas migré)
-    if not verify_password(email_lc, password or ""):
-        return HTMLResponse("<p>Invalid credentials.</p><p><a href='/login'>Back</a></p>", status_code=401)
-
-    request.session["user_email"] = email_lc
-    return RedirectResponse(url="/chat-ui", status_code=HTTP_303_SEE_OTHER)
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "docqa-api"}
 
 
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
-    return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    return {"ok": True}
 
+
+@app.get("/me")
+def me(request: Request):
+    email = (request.session.get("user_email") or "").strip().lower()
+    tier = get_user_tier(email)
+    if not tier:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return {"email": email, "tier": tier}
 
 app.include_router(estimator_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
-        # si tu as un domaine custom plus tard, ajoute-le ici aussi
-    ],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 sync_in_progress = False
@@ -979,129 +978,22 @@ async def chat_api(
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.get("/chat-ui", response_class=HTMLResponse)
-def chat_ui(request: Request):
-    email = (request.session.get("user_email") or "").strip().lower()
-    if not get_user_tier(email):
-        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
-    html = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>ShipERP AI Bot</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
-    textarea, button { font-size: 14px; padding: 10px; }
-    textarea { width: 100%; height: 90px; }
-    #chat { border: 1px solid #ddd; padding: 12px; border-radius: 8px; height: 420px; overflow: auto; background: #fafafa; }
-    .msg { margin: 10px 0; }
-    .bubble { padding: 10px; border-radius: 10px; display: inline-block; max-width: 90%; white-space: pre-wrap; }
-    .b-user { background: #e8f0ff; }
-    .b-assistant { background: #e9ffe8; }
-    .upload-box { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background:#f9f9f9; }
-  </style>
-</head>
-<body>
-
-<h2>ShipERP AI Bot</h2>
-<p>User: <b>__USER_ID__</b></p>
-
-<div class="upload-box">
-  <h3>Upload a Document (private to you)</h3>
-  <input type="file" id="fileInput" />
-  <button onclick="uploadFile()">Upload</button>
-  <span id="uploadStatus"></span>
-</div>
-
-<div id="chat"></div>
-
-<div style="margin-top: 12px;">
-  <textarea id="msg" placeholder="Type your message..."></textarea>
-  <div style="margin-top: 10px;">
-    <button onclick="send()">Send</button>
-    <form method="post" action="/logout" style="display:inline;">
-      <button type="submit">Logout</button>
-    </form>
-  </div>
-</div>
-
-<script>
-  const chatEl = document.getElementById('chat');
-  const msgEl = document.getElementById('msg');
-
-  function append(role, text) {
-    const div = document.createElement('div');
-    div.className = 'msg';
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble ' + (role === 'user' ? 'b-user' : 'b-assistant');
-    bubble.textContent = text;
-    div.appendChild(bubble);
-    chatEl.appendChild(div);
-    chatEl.scrollTop = chatEl.scrollHeight;
-  }
-
-  async function send() {
-    const message = (msgEl.value || '').trim();
-    if (!message) return;
-
-    append('user', message);
-    msgEl.value = '';
-
-    const form = new FormData();
-    form.append('message', message);
-
-    try {
-      const res = await fetch('/chat-api', { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Request failed');
-      append('assistant', data.answer || '(no answer)');
-    } catch (e) {
-      append('assistant', 'ERROR: ' + e.message);
-    }
-  }
-
-  async function uploadFile() {
-    const fileInput = document.getElementById("fileInput");
-    const status = document.getElementById("uploadStatus");
-
-    if (!fileInput.files || !fileInput.files[0]) {
-      status.textContent = "Select a file first.";
-      return;
-    }
-
-    status.textContent = "Uploading...";
-
-    const form = new FormData();
-    form.append("file", fileInput.files[0]);
-
-    try {
-      const res = await fetch('/upload', { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Upload failed');
-      status.textContent = "Uploaded successfully.";
-    } catch (e) {
-      status.textContent = "ERROR: " + e.message;
-    }
-  }
-
-  append('assistant', 'Welcome. You can upload a document and ask questions about it.');
-</script>
-
-</body>
-</html>
-"""
-    return HTMLResponse(html.replace("__USER_ID__", email))
 
 
 
 # =========================
 # Admin pages
 # =========================
+def require_internal(request: Request) -> str:
+    email = (request.session.get("user_email") or "").strip().lower()
+    if get_user_tier(email) != "internal":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return email
+
 @app.get("/admin", response_class=HTMLResponse)
-def admin_dashboard():
+def admin_dashboard(request: Request):
+    require_internal(request)
     users = "<br>".join([f"{email}" for email in INTERNAL_USERS.keys()])
     return f"""
         <h2>Internal Users</h2>
@@ -1118,7 +1010,9 @@ def admin_dashboard():
 
 
 @app.post("/admin/add")
-def add_internal_user(email: str = Form(...)):
+def add_internal_user(request: Request, email: str = Form(...)):
+    require_internal(request)
+    email = (email or "").strip().lower()
     INTERNAL_USERS[email] = True
     with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
         json.dump(INTERNAL_USERS, f, indent=2)
@@ -1127,7 +1021,9 @@ def add_internal_user(email: str = Form(...)):
 
 
 @app.post("/admin/remove")
-def remove_internal_user(email: str = Form(...)):
+def remove_internal_user(request: Request, email: str = Form(...)):
+    require_internal(request)
+    email = (email or "").strip().lower()
     if email in INTERNAL_USERS:
         del INTERNAL_USERS[email]
         with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
