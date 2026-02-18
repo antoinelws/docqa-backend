@@ -64,6 +64,7 @@ def sync_sharepoint():
 
     def walk(folder_path: str):
         items = list_children(headers, folder_path)
+        print(f"Listing {folder_path}: {len(items)} items")
         for item in items:
             name = item.get("name", "")
             item_path = f"{folder_path}/{name}"
