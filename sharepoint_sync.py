@@ -46,9 +46,16 @@ def authenticate():
 def list_children(headers, folder_path: str):
     encoded_path = folder_path.replace(" ", "%20")
     url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{encoded_path}:/children"
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("value", [])
+
+    all_items = []
+    while url:
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        all_items.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")  # pagination
+    return all_items
+
 
 
 def sync_sharepoint():
