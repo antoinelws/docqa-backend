@@ -4,11 +4,11 @@ import faiss
 import numpy as np
 import pdfplumber
 from pathlib import Path
-import openai
 from tqdm import tqdm
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
@@ -38,11 +38,12 @@ def chunk_text(text, max_chars=CHUNK_SIZE):
     return chunks
 
 def embed_batch(texts):
-    response = openai.Embedding.create(
+    response = client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=texts
     )
-    return [d["embedding"] for d in response["data"]]
+    return [d.embedding for d in response.data]
+
 
 def build_index(docs_path, output_path):
 
