@@ -6,7 +6,7 @@ import pdfplumber
 from pathlib import Path
 from tqdm import tqdm
 from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI()
 
 
 
@@ -38,11 +38,11 @@ def chunk_text(text, max_chars=CHUNK_SIZE):
     return chunks
 
 def embed_batch(texts):
-    response = client.embeddings.create(
+    resp = client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=texts
     )
-    return [d.embedding for d in response.data]
+    return [d.embedding for d in resp.data]
 
 
 def build_index(docs_path, output_path):
