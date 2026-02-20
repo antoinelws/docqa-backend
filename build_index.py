@@ -9,7 +9,8 @@ from openai import OpenAI
 client = OpenAI()
 
 
-
+MAX_CHARS_PER_CHUNK = 6000   # safe
+BATCH_SIZE = 64              # safe
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 CHUNK_SIZE = 1000
@@ -38,12 +39,11 @@ def chunk_text(text, max_chars=CHUNK_SIZE):
     return chunks
 
 def embed_batch(texts):
-    resp = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts
-    )
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not texts:
+        return []
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [d.embedding for d in resp.data]
-
 
 def build_index(docs_path, output_path):
 
@@ -70,14 +70,35 @@ def build_index(docs_path, output_path):
     pdf_files = list(docs_path.rglob("*.pdf"))
     print(f"Found {len(pdf_files)} PDFs")
 
-    for pdf in tqdm(pdf_files):
-        text = extract_text(pdf)
-        chunks = chunk_text(text)
+for pdf in tqdm(pdf_files):
+    text = extract_text(pdf)
+    chunks = chunk_text(text)
 
-        if not chunks:
+    # Nettoyage: remove empty + trim + truncate
+    clean = []
+    for ch in chunks:
+        if not ch:
             continue
+        ch = ch.strip()
+        if not ch:
+            continue
+        if len(ch) > MAX_CHARS_PER_CHUNK:
+            ch = ch[:MAX_CHARS_PER_CHUNK]
+        clean.append(ch)
 
-        embeddings = embed_batch(chunks)
+    if not clean:
+        continue
+
+    print(f"Processing {pdf} with {len(clean)} chunks")
+
+    # Embed par batch
+    embeddings = []
+    for i in range(0, len(clean), BATCH_SIZE):
+        batch = clean[i:i + BATCH_SIZE]
+        embeddings.extend(embed_batch(batch))
+
+    # IMPORTANT: on remplace chunks par clean pour matcher embeddings
+    chunks = clean
 
         for chunk, emb in zip(chunks, embeddings):
             c.execute("INSERT INTO chunks (file, chunk) VALUES (?, ?)",
