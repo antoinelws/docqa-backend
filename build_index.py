@@ -9,23 +9,16 @@ import docx
 from tqdm import tqdm
 from openai import OpenAI
 
-# -------------------------
-# Config
-# -------------------------
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 
-CHUNK_SIZE_CHARS = 1000          # découpe "logique"
-MAX_CHARS_PER_CHUNK = 6000       # hard cap pour éviter input invalide
-BATCH_SIZE = 64                  # batch embeddings
+CHUNK_SIZE_CHARS = 1000
+MAX_CHARS_PER_CHUNK = 6000
+BATCH_SIZE = 64
 
-# OpenAI client (lit OPENAI_API_KEY depuis l'env automatiquement)
 client = OpenAI()
 
 
-# -------------------------
-# Extraction texte
-# -------------------------
 def extract_text_pdf(path: Path) -> str:
     parts = []
     with pdfplumber.open(str(path)) as pdf:
@@ -54,11 +47,7 @@ def extract_text(path: Path) -> str:
     return ""
 
 
-# -------------------------
-# Chunking + nettoyage
-# -------------------------
 def chunk_text(text: str, max_chars: int = CHUNK_SIZE_CHARS) -> list[str]:
-    # Chunking simple par phrases (suffisant pour démarrer)
     sentences = text.split(". ")
     chunks = []
     current = ""
@@ -90,41 +79,27 @@ def clean_chunks(chunks: list[str]) -> list[str]:
         ch = ch.strip()
         if not ch:
             continue
-        # hard cap pour éviter erreurs input
         if len(ch) > MAX_CHARS_PER_CHUNK:
             ch = ch[:MAX_CHARS_PER_CHUNK]
         clean.append(ch)
     return clean
 
 
-# -------------------------
-# Embeddings
-# -------------------------
 def embed_batch(texts: list[str]) -> list[list[float]]:
-    # Filtre final (parano)
     texts = [t for t in texts if isinstance(t, str) and t.strip()]
     if not texts:
         return []
 
-    resp = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts
-    )
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [d.embedding for d in resp.data]
 
 
-# -------------------------
-# Index build
-# -------------------------
 def build_index(docs_path: str, out_path: str):
     docs_path = Path(docs_path)
     out_path = Path(out_path)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # FAISS
-    index = faiss.IndexFlatL2(VECTOR_DIM)
-
-    # SQLite metadata
+    # SQLite
     db_path = out_path / "meta.db"
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -137,73 +112,77 @@ def build_index(docs_path: str, out_path: str):
     """)
     conn.commit()
 
-    # Collect vectors in RAM then add once (ok vu ton volume)
-    all_vectors: list[list[float]] = []
-    rows_to_insert: list[tuple[str, str]] = []
+    # FAISS (streaming)
+    index = faiss.IndexFlatL2(VECTOR_DIM)
+    faiss_path_tmp = out_path / "faiss.index.tmp"
+    faiss_path_final = out_path / "faiss.index"
 
-    # PDFs + DOCX
     files = sorted(list(docs_path.rglob("*.pdf")) + list(docs_path.rglob("*.docx")))
     print(f"Found {len(files)} files (PDF+DOCX) under {docs_path}")
+
+    inserted = 0
+    pending_rows: list[tuple[str, str]] = []
 
     for f in tqdm(files):
         text = extract_text(f)
         if not text.strip():
             continue
 
-        chunks = chunk_text(text)
-        chunks = clean_chunks(chunks)
+        chunks = clean_chunks(chunk_text(text))
         if not chunks:
             continue
 
-        # embed par batch
-        embeddings: list[list[float]] = []
-        for i in range(0, len(chunks), BATCH_SIZE):
-            batch = chunks[i:i + BATCH_SIZE]
-            embs = embed_batch(batch)
-            # En cas de retour inattendu (rare), on garde la cohérence
-            if len(embs) != len(batch):
-                raise RuntimeError(f"Embedding count mismatch for {f}: got {len(embs)} for batch {len(batch)}")
-            embeddings.extend(embs)
-
-        # store meta + vectors
+        # embed & add in FAISS by micro-batch
         f_str = str(f)
-        for ch, emb in zip(chunks, embeddings):
-            rows_to_insert.append((f_str, ch))
-            all_vectors.append(emb)
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batch_chunks = chunks[i:i + BATCH_SIZE]
+            embs = embed_batch(batch_chunks)
 
-        # flush sqlite toutes les ~2000 chunks pour éviter mémoire/temps
-        if len(rows_to_insert) >= 2000:
-            cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", rows_to_insert)
-            conn.commit()
-            rows_to_insert.clear()
+            if len(embs) != len(batch_chunks):
+                raise RuntimeError(f"Embedding count mismatch for {f}: got {len(embs)} for {len(batch_chunks)}")
 
-    # flush restant
-    if rows_to_insert:
-        cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", rows_to_insert)
+            # Add to FAISS immediately (low RAM)
+            vecs = np.array(embs, dtype="float32")
+            index.add(vecs)
+
+            # Add to SQLite buffer
+            for ch in batch_chunks:
+                pending_rows.append((f_str, ch))
+
+            inserted += len(batch_chunks)
+
+            # flush sqlite regularly
+            if len(pending_rows) >= 2000:
+                cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", pending_rows)
+                conn.commit()
+                pending_rows.clear()
+
+        # optional: write partial index occasionally (crash safety)
+        if inserted % 5000 == 0:
+            faiss.write_index(index, str(faiss_path_tmp))
+
+    # flush rest
+    if pending_rows:
+        cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", pending_rows)
         conn.commit()
-        rows_to_insert.clear()
+        pending_rows.clear()
 
-    if not all_vectors:
-        conn.close()
-        raise RuntimeError("No vectors were created. Check extraction/chunking.")
-
-    vectors_np = np.array(all_vectors, dtype="float32")
-    index.add(vectors_np)
-
-    faiss_path = out_path / "faiss.index"
-    faiss.write_index(index, str(faiss_path))
+    # final write
+    faiss.write_index(index, str(faiss_path_final))
+    if faiss_path_tmp.exists():
+        faiss_path_tmp.unlink(missing_ok=True)
 
     conn.close()
-    print(f"✅ Index build complete: {faiss_path} + {db_path}")
-    print(f"Total vectors: {vectors_np.shape[0]}")
+
+    print(f"✅ Index build complete: {faiss_path_final} + {db_path}")
+    print(f"Total vectors: {index.ntotal}")
 
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--docs", required=True, help="Folder containing documents (pdf/docx)")
-    parser.add_argument("--out", required=True, help="Output folder for faiss.index + meta.db")
+    parser.add_argument("--docs", required=True)
+    parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
     build_index(args.docs, args.out)
