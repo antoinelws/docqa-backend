@@ -8,26 +8,33 @@ import pdfplumber
 import docx
 from tqdm import tqdm
 from openai import OpenAI
+import gc
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 
 CHUNK_SIZE_CHARS = 1000
 MAX_CHARS_PER_CHUNK = 6000
-BATCH_SIZE = 64
+BATCH_SIZE = 16
+MAX_PAGES = 150
 
 client = OpenAI()
+
+
 
 
 def extract_text_pdf(path: Path) -> str:
     parts = []
     with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
+        for i in range(min(len(pdf.pages), MAX_PAGES)):
+            page = pdf.pages[i]
             t = page.extract_text()
             if t:
                 parts.append(t)
+            # mini garde-fou : flush toutes les 25 pages
+            if i > 0 and i % 25 == 0:
+                gc.collect()
     return "\n".join(parts)
-
 
 def extract_text_docx(path: Path) -> str:
     d = docx.Document(str(path))
@@ -124,6 +131,7 @@ def build_index(docs_path: str, out_path: str):
     pending_rows: list[tuple[str, str]] = []
 
     for f in tqdm(files):
+        print(f"Processing file: {f}", flush=True)
         text = extract_text(f)
         if not text.strip():
             continue
