@@ -730,14 +730,10 @@ def trigger_sync(background_tasks: BackgroundTasks):
 # One-shot QA (/ask)
 # =========================
 @app.post("/ask")
-def ask_question(
-    question: str = Form(...),
-    user_email: str = Form(...),
-    debug: bool = Form(False),
-):
+def ask_question(request: Request, question: str = Form(...), debug: bool = Form(False)):
     try:
         question = (question or "").strip()
-        email_lc = (user_email or "").strip().lower()
+        email_lc = (request.session.get("user_email") or "").strip().lower()
 
         tier = get_user_tier(email_lc)
         if not tier:
@@ -799,6 +795,9 @@ def ask_question(
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+print("DEBUG tier:", tier)
+print("DEBUG chunks:", len(chunks))
+print("DEBUG sources:", sources[:5])
 
 # =========================
 # Conversation (per-user) + RAG
@@ -879,6 +878,7 @@ async def chat_api(
     message: str = Form(...),
     debug: bool = Form(False),
 ):
+    # --- Auth via session ---
     email = (request.session.get("user_email") or "").strip().lower()
     tier = get_user_tier(email)
     if not tier:
@@ -886,21 +886,25 @@ async def chat_api(
 
     user_id = email
 
+    # --- Validate input ---
     message = (message or "").strip()
     if not message:
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
-    safe_email = _safe_email_folder(email)
+    # --- Per-user uploads folder ---
+    safe_email = _safe_email_folder(email)  # assure-toi que cette fonction existe
     user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
     os.makedirs(user_upload_folder, exist_ok=True)
 
     try:
         import re
 
+        # --- Chat state ---
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
         _summarize_if_needed(user_id)
 
+        # --- Special case: “what was my first question?” etc ---
         msg_lc = message.lower().strip()
 
         def is_chat_memory_question(s: str) -> bool:
@@ -924,11 +928,12 @@ async def chat_api(
 
         if is_chat_memory_question(msg_lc):
             user_msgs = [
-                m.get("content", "").strip()
+                (m.get("content") or "").strip()
                 for m in state.get("messages", [])
                 if m.get("role") == "user" and (m.get("content") or "").strip()
             ]
-            if user_msgs and user_msgs[-1].strip().lower() == message.strip().lower():
+            # enlever le message courant
+            if user_msgs and user_msgs[-1].lower() == message.lower():
                 user_msgs = user_msgs[:-1]
 
             if user_msgs:
@@ -940,9 +945,11 @@ async def chat_api(
             state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
             return {"answer": answer, "user_id": user_id, "sources": []}
 
-        summary = (state["summary"] or "").strip()
+        # --- Build prompt context ---
+        summary = (state.get("summary") or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
+        # --- RAG retrieval (NEW consolidated + uploads) ---
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=message,
             tier=tier,
@@ -953,6 +960,7 @@ async def chat_api(
             chunk_max_chars=1200,
             debug=debug,
         )
+
         has_docs = bool(chunks)
         docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
 
@@ -976,7 +984,8 @@ async def chat_api(
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
-        if answer.lower().startswith(FALLBACK_MARKER):
+        # --- Final formatting ---
+        if (answer or "").lower().startswith(FALLBACK_MARKER):
             final_answer = answer
             out_sources = []
         else:
@@ -985,20 +994,26 @@ async def chat_api(
 
         state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
 
+        # keep memory bounded
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
         payload: Dict[str, Any] = {"answer": final_answer, "user_id": user_id, "sources": out_sources}
         if debug:
-            payload["has_docs"] = has_docs
-            payload["model"] = CHAT_MODEL
-            payload["tier"] = tier
+            payload.update(
+                {
+                    "has_docs": has_docs,
+                    "tier": tier,
+                    "user_upload_folder": user_upload_folder,
+                    "sources_preview": uniq_sources[:10],
+                    "chunks_count": len(chunks),
+                }
+            )
 
         return payload
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 # =========================
 # Admin pages
