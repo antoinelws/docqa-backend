@@ -143,7 +143,7 @@ def verify_password(email: str, password: str) -> bool:
 # =========================
 # OpenAI client + wrappers (SDK v2.x)
 # =========================
-client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
     resp = _openai_client.chat.completions.create(
@@ -494,11 +494,7 @@ def retrieve_chunks_with_sources(
     chunk_max_chars: int = 1200,
     debug: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """
-    Hybrid retrieval:
-    - consolidated index for tier ("public"/"internal") from /data/indexes/{tier}
-    - per-user uploads still per-doc index (*.json + *.index) under /data/documents/uploads/{safe_email}
-    """
+
     question = (question or "").strip()
     if not question:
         return [], []
@@ -508,24 +504,30 @@ def retrieve_chunks_with_sources(
         return [], []
     qvec = qvecs[0]
 
-        # --- Keyword anti-regression (acronyms like ShipERP) ---
-    q_lc = question.lower()
-    keyword_boost_chunks: List[Tuple[str, str, str]] = []  # (chunk, src, tier)
-    if "shiperp" in q_lc:
-        rows = keyword_chunks_from_consolidated("public", "shiperp", limit=10)
-        for fp, ch in rows:
-            src = os.path.basename(fp) if fp else "unknown"
-            if ch.strip():
-                # dist=-1 to force top
-                scored.append((-1.0, ch.strip(), src))
+    # scored must exist BEFORE any append
+    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
 
-        if tier == "internal":
-            rows = keyword_chunks_from_consolidated("internal", "shiperp", limit=10)
+    # --- Keyword anti-regression (acronyms like ShipERP) ---
+    q_lc = question.lower()
+    if "shiperp" in q_lc:
+        try:
+            rows = keyword_chunks_from_consolidated("public", "shiperp", limit=10)
             for fp, ch in rows:
                 src = os.path.basename(fp) if fp else "unknown"
-                if ch.strip():
-                    scored.append((-1.0, ch.strip(), src))
-    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
+                ch = (ch or "").strip()
+                if ch:
+                    scored.append((-1.0, ch, src))
+
+            if tier == "internal":
+                rows = keyword_chunks_from_consolidated("internal", "shiperp", limit=10)
+                for fp, ch in rows:
+                    src = os.path.basename(fp) if fp else "unknown"
+                    ch = (ch or "").strip()
+                    if ch:
+                        scored.append((-1.0, ch, src))
+        except Exception as e:
+            if debug:
+                print("[RAG][DEBUG] keyword fallback error:", e)
 
     # 1) consolidated public/internal
     try:
