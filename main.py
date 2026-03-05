@@ -1,9 +1,16 @@
-import os, json, glob, asyncio, datetime, tempfile
+# main.py
+import os
+import json
+import glob
+import asyncio
+import datetime
+import tempfile
+import sqlite3
+import threading
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, Any, Optional, List, Tuple
-from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks, HTTPException
-
+from urllib.parse import urlparse
 
 import bcrypt
 import requests
@@ -12,67 +19,90 @@ import docx
 import faiss
 import numpy as np
 
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from dotenv import load_dotenv
-from msal import ConfidentialClientApplication
-
+from fastapi import FastAPI, Request, Form, File, UploadFile, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.status import HTTP_303_SEE_OTHER
 
-from sow_estimator import router as estimator_router
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from dotenv import load_dotenv
+from msal import ConfidentialClientApplication
 
+from openai import OpenAI
+
+from sow_estimator import router as estimator_router
 
 
 # =========================
 # Config
 # =========================
 load_dotenv()
+
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Models (Option B constants kept, routing can be re-added once stable)
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
+
+# Models
 MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
 MODEL_BIG = os.getenv("OPENAI_MODEL_BIG", "gpt-5.2")
 
+# SharePoint
 DRIVE_ID = os.getenv(
     "SHAREPOINT_DRIVE_ID",
     "b!rsvKwTOMNUeCRjsRDMZh-kprgBi3tc1LiWVKbiOrmtWWapTcFH-5QLtKqb12SEmT",
 )
-FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "AI")
+FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "AI")  # root folder in drive
 
-DESTINATION_FOLDER = "documents"
+# Storage
+BASE_STORAGE = "/data"
+DESTINATION_FOLDER = os.path.join(BASE_STORAGE, "documents")  # /data/documents/{tier}/...
+INDEXES_FOLDER = os.path.join(BASE_STORAGE, "indexes")        # /data/indexes/{tier}/faiss.index + meta.db
+LOGS_FOLDER = os.path.join(BASE_STORAGE, "logs")
+
 os.makedirs(DESTINATION_FOLDER, exist_ok=True)
-HISTORY_LOG = os.path.join(DESTINATION_FOLDER, "sync_log.csv")
+os.makedirs(INDEXES_FOLDER, exist_ok=True)
+os.makedirs(LOGS_FOLDER, exist_ok=True)
 
+HISTORY_LOG = os.path.join(LOGS_FOLDER, "sync_log.csv")
+
+# Embeddings
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 
+# Azure auth
 SCOPES = ["https://graph.microsoft.com/.default"]
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
+# Auth users
 PUBLIC_USER_FILE = "public_users.json"
 INTERNAL_USER_FILE = "internal_users.json"
 
+# Frontend allowlist
+FRONTEND_ORIGINS = [
+    "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
+    # later: "https://portal.shiperp.com",
+]
+
+FALLBACK_MARKER = "the documentation does not mention this, but here is what i know from general knowledge:"
+
+
+# =========================
+# Utils: users
+# =========================
 def _load_users(path: str) -> Dict[str, Any]:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     return {}
 
-INTERNAL_USERS = _load_users(INTERNAL_USER_FILE)  # email -> true OR {"password_hash": "..."}
-PUBLIC_USERS = _load_users(PUBLIC_USER_FILE)      # email -> true OR {"password_hash": "..."}
+INTERNAL_USERS = _load_users(INTERNAL_USER_FILE)  # email -> True OR {"password_hash": "..."}
+PUBLIC_USERS = _load_users(PUBLIC_USER_FILE)      # email -> True OR {"password_hash": "..."}
 
-
-FALLBACK_MARKER = "the documentation does not mention this, but here is what i know from general knowledge:"
-
-
-# =========================
-# OpenAI helpers
-# =========================
 def is_allowed(users: Dict[str, Any], email: str) -> bool:
     v = users.get(email)
     if v is True:
@@ -106,26 +136,128 @@ def verify_password(email: str, password: str) -> bool:
     rec_hash = get_password_hash(INTERNAL_USERS, email) or get_password_hash(PUBLIC_USERS, email)
     if not rec_hash:
         return False
-
     return bcrypt.checkpw(password.encode("utf-8"), rec_hash.encode("utf-8"))
+
+
+# =========================
+# OpenAI client + wrappers (SDK v2.x)
+# =========================
+_openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
     """
-    Minimal wrapper to avoid params that some endpoints reject.
-    IMPORTANT: Uses legacy openai SDK style (openai.ChatCompletion.create).
+    OpenAI SDK v2: client.chat.completions.create
     """
-    import openai
-
-    openai.api_key = OPENAI_API_KEY
-    resp = openai.ChatCompletion.create(
+    resp = _openai_client.chat.completions.create(
         model=model,
         messages=messages,
         max_completion_tokens=max_completion_tokens,
     )
-    return (resp.choices[0].message.content or "").strip()
+    out = resp.choices[0].message.content or ""
+    return out.strip()
+
+def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
+    """
+    Safe embedding batching. Truncates long inputs and skips empty strings.
+    """
+    clean: List[str] = []
+    for t in texts:
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if len(t) < 10:
+            continue
+        if len(t) > 6000:
+            t = t[:6000]
+        clean.append(t)
+
+    if not clean:
+        return []
+
+    vectors: List[List[float]] = []
+    for i in range(0, len(clean), batch_size):
+        batch = clean[i : i + batch_size]
+        try:
+            resp = _openai_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            vectors.extend([d.embedding for d in resp.data])
+        except Exception as e:
+            print("[EMBEDDING ERROR] batch skipped:", str(e))
+    return vectors
+
 
 # =========================
-# Auth / Login (SSO helpers)
+# Consolidated index loading (public/internal)
+# =========================
+_FAISS_LOCK = threading.Lock()
+
+@lru_cache(maxsize=4)
+def load_consolidated_index(tier: str):
+    """
+    Load FAISS + sqlite meta for a tier ("public" / "internal") from /data/indexes/{tier}.
+    Returns (faiss_index, sqlite_db_path).
+    """
+    tier = (tier or "").strip().lower()
+    if tier not in ("public", "internal"):
+        raise ValueError("tier must be public or internal")
+
+    idx_dir = Path(INDEXES_FOLDER) / tier
+    faiss_path = idx_dir / "faiss.index"
+    db_path = idx_dir / "meta.db"
+
+    if not faiss_path.exists() or not db_path.exists():
+        raise FileNotFoundError(f"Missing consolidated index for {tier}: {faiss_path} / {db_path}")
+
+    index = faiss.read_index(str(faiss_path))
+    return index, str(db_path)
+
+def fetch_chunks_from_meta(db_path: str, ids_1based: List[int]) -> List[Tuple[str, str]]:
+    """
+    Returns list of (file, chunk) for given sqlite row ids (1-based).
+    Preserves input order.
+    """
+    if not ids_1based:
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        out: List[Tuple[str, str]] = []
+        for rid in ids_1based:
+            c.execute("SELECT file, chunk FROM chunks WHERE id = ?", (rid,))
+            row = c.fetchone()
+            if row and row[1]:
+                out.append((row[0] or "", row[1] or ""))
+        return out
+    finally:
+        conn.close()
+
+def search_consolidated(tier: str, qvec: List[float], k: int = 12) -> List[Tuple[float, str, str]]:
+    """
+    Returns list of (dist, chunk, source_filebasename) from consolidated index.
+    """
+    index, db_path = load_consolidated_index(tier)
+
+    with _FAISS_LOCK:
+        D, I = index.search(np.array([qvec]).astype("float32"), k=k)
+
+    # FAISS ids are 0-based; sqlite AUTOINCREMENT ids are 1-based
+    ids_1based: List[int] = []
+    dists: List[float] = []
+    for dist, idx0 in zip(D[0], I[0]):
+        if idx0 < 0:
+            continue
+        ids_1based.append(int(idx0) + 1)
+        dists.append(float(dist))
+
+    rows = fetch_chunks_from_meta(db_path, ids_1based)
+    scored: List[Tuple[float, str, str]] = []
+    for dist, (file_path, chunk) in zip(dists, rows):
+        src = os.path.basename(file_path) if file_path else "unknown"
+        scored.append((dist, (chunk or "").strip(), src))
+    return scored
+
+
+# =========================
+# SSO tokens
 # =========================
 SSO_SECRET = os.getenv("SSO_SECRET", "")
 if not SSO_SECRET:
@@ -151,12 +283,21 @@ def verify_sso_token(token: str, max_age_seconds: int = 300) -> Dict[str, Any]:
     except BadSignature:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def _is_allowed_next(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        if u.scheme != "https":
+            return False
+        origin = f"{u.scheme}://{u.netloc}"
+        return origin in FRONTEND_ORIGINS
+    except Exception:
+        return False
 
 
 # =========================
-# Auth / SharePoint
+# SharePoint auth + sync (download only)
 # =========================
-def authenticate() -> str:
+def authenticate_graph() -> str:
     app = ConfidentialClientApplication(
         CLIENT_ID,
         authority=AUTHORITY,
@@ -167,13 +308,107 @@ def authenticate() -> str:
         raise Exception(f"Authentication failed: {result}")
     return result["access_token"]
 
+def log_sync_activity(filename: str, user_name: str, user_email: str):
+    ts = datetime.datetime.utcnow().isoformat()
+    with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{ts},{filename},{user_name},{user_email}\n")
+
+def _graph_children_by_path(headers: dict, drive_id: str, path: str) -> List[dict]:
+    # path is like "AI/public/PPT_PDF"
+    encoded = path.replace(" ", "%20")
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded}:/children"
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json().get("value", []) or []
+
+def sync_sharepoint_download_only(
+    tier: str,
+    sp_subpath: str,
+    dest_root: str,
+    allowed_exts: Optional[List[str]] = None,
+    max_files: Optional[int] = None,
+):
+    """
+    Recursively downloads allowed file types from SharePoint folder path:
+      {FOLDER_PATH}/{sp_subpath}
+    into:
+      {dest_root}/{tier}/... (preserves subfolders)
+
+    This function does NOT build embeddings. You run build_index.py separately.
+    """
+    tier = (tier or "").strip().lower()
+    if tier not in ("public", "internal"):
+        raise ValueError("tier must be public or internal")
+
+    allowed_exts = allowed_exts or ["pdf", "docx", "txt"]
+    allowed_exts = [e.lower().lstrip(".") for e in allowed_exts]
+
+    access_token = authenticate_graph()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    base_sp_path = f"{FOLDER_PATH}/{sp_subpath}".strip("/")
+
+    dest_tier_root = Path(dest_root) / tier
+    dest_tier_root.mkdir(parents=True, exist_ok=True)
+
+    downloaded = 0
+
+    def walk(sp_path: str, rel_dest: Path):
+        nonlocal downloaded
+        if max_files is not None and downloaded >= max_files:
+            return
+
+        items = _graph_children_by_path(headers, DRIVE_ID, sp_path)
+
+        for item in items:
+            if max_files is not None and downloaded >= max_files:
+                return
+
+            name = item.get("name") or ""
+            if not name:
+                continue
+
+            is_folder = "folder" in item
+            if is_folder:
+                walk(f"{sp_path}/{name}", rel_dest / name)
+                continue
+
+            ext = name.lower().split(".")[-1]
+            if ext not in allowed_exts:
+                continue
+
+            download_url = item.get("@microsoft.graph.downloadUrl")
+            if not download_url:
+                continue
+
+            dest_dir = dest_tier_root / rel_dest
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            dest_path = dest_dir / name
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                continue
+
+            print(f"Downloading: {sp_path}/{name}")
+            file_data = requests.get(download_url, timeout=180)
+            file_data.raise_for_status()
+            dest_path.write_bytes(file_data.content)
+
+            user_info = item.get("createdBy", {}).get("user", {}) or {}
+            user_name = user_info.get("displayName", "Unknown")
+            user_email = user_info.get("email", "Unknown")
+            log_sync_activity(f"{sp_path}/{name}", user_name, user_email)
+
+            downloaded += 1
+
+    walk(base_sp_path, Path("."))
+    print(f"✅ Download sync complete for tier={tier}. Downloaded {downloaded} file(s).")
+
 
 # =========================
-# Text extraction + chunking
+# Upload parsing + chunking (uploads only)
 # =========================
 def extract_text(filename: str, content: bytes) -> str:
-    """Extracts text from pdf/docx/txt."""
-    ext = filename.lower().split(".")[-1]
+    ext = (filename or "").lower().split(".")[-1]
 
     if ext == "pdf":
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
@@ -197,14 +432,13 @@ def extract_text(filename: str, content: bytes) -> str:
 
     return ""
 
-
 def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
-    """Simple chunker for docs."""
     text = (text or "").strip()
     if not text:
         return []
     sentences = text.split(". ")
-    chunks, buf = [], ""
+    chunks: List[str] = []
+    buf = ""
     for s in sentences:
         s = (s or "").strip()
         if not s:
@@ -220,189 +454,118 @@ def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
         chunks.append(buf.strip())
     return chunks
 
-
-# =========================
-# Embeddings (safe)
-# =========================
-def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
-    """Safe embedding; skips failing batches."""
-    import openai
-
-    openai.api_key = OPENAI_API_KEY
-
-    clean_texts: List[str] = []
-    for t in texts:
-        if not t or not isinstance(t, str):
-            continue
-        t = t.strip()
-        if len(t) < 10:
-            continue
-        if len(t) > 6000:
-            t = t[:6000]
-        clean_texts.append(t)
-
-    if not clean_texts:
-        return []
-
-    vectors: List[List[float]] = []
-    for i in range(0, len(clean_texts), batch_size):
-        batch = clean_texts[i : i + batch_size]
-        try:
-            resp = openai.Embedding.create(model=EMBEDDING_MODEL, input=batch)
-            vectors.extend([d["embedding"] for d in resp["data"]])
-        except Exception as e:
-            print("[EMBEDDING ERROR] batch skipped:", str(e))
-    return vectors
+def _safe_email_folder(email: str) -> str:
+    return (
+        (email or "")
+        .replace("@", "_at_")
+        .replace(".", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
 
 
 # =========================
-# Index cache
+# Retrieval: consolidated (public/internal) + uploads per-doc
 # =========================
-@lru_cache(maxsize=8)
-def load_folder_indexes(folder: str) -> List[Tuple[List[str], faiss.Index]]:
-    """Loads all {doc}.json + {doc}.index pairs in a folder once, then caches them."""
-    results: List[Tuple[List[str], faiss.Index]] = []
-    paths = glob.glob(f"{folder}/*.json")
+def retrieve_chunks_with_sources(
+    question: str,
+    tier: str,
+    user_upload_folder: str,
+    k_public_internal: int = 18,
+    k_per_doc_upload: int = 6,
+    max_total: int = 12,
+    chunk_max_chars: int = 1200,
+    debug: bool = False,
+) -> Tuple[List[str], List[str]]:
+    """
+    Hybrid retrieval:
+    - consolidated index for tier ("public"/"internal") from /data/indexes/{tier}
+    - per-user uploads still per-doc index (*.json + *.index) under /data/documents/uploads/{safe_email}
+    """
+    question = (question or "").strip()
+    if not question:
+        return [], []
 
-    for json_path in paths:
-        base = os.path.splitext(os.path.basename(json_path))[0]
-        index_path = os.path.join(folder, f"{base}.index")
-        if not os.path.exists(index_path):
-            continue
+    qvecs = embed_texts([question])
+    if not qvecs:
+        return [], []
+    qvec = qvecs[0]
 
-        with open(json_path, "r", encoding="utf-8") as f:
-            chunks = json.load(f)
+    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
 
-        index = faiss.read_index(index_path)
-        results.append((chunks, index))
-
-    return results
-
-
-@lru_cache(maxsize=8)
-def load_folder_indexes_with_names(folder: str) -> List[Tuple[str, List[str], faiss.Index]]:
-    """Same as load_folder_indexes, but includes doc name (basename)."""
-    results: List[Tuple[str, List[str], faiss.Index]] = []
-    paths = glob.glob(f"{folder}/*.json")
-
-    for json_path in paths:
-        base = os.path.splitext(os.path.basename(json_path))[0]
-        index_path = os.path.join(folder, f"{base}.index")
-        if not os.path.exists(index_path):
-            continue
-
-        with open(json_path, "r", encoding="utf-8") as f:
-            chunks = json.load(f)
-
-        index = faiss.read_index(index_path)
-        results.append((base, chunks, index))
-
-    return results
-
-
-def clear_index_cache():
+    # 1) consolidated public/internal
     try:
-        load_folder_indexes.cache_clear()
-        load_folder_indexes_with_names.cache_clear()
-        print("Index cache cleared.")
+        scored.extend(search_consolidated("public", qvec, k=k_public_internal))
+        if tier == "internal":
+            scored.extend(search_consolidated("internal", qvec, k=k_public_internal))
     except Exception as e:
-        print("Failed to clear index cache:", e)
+        if debug:
+            print("[RAG][DEBUG] consolidated search error:", e)
+
+    # 2) user uploads (per-doc)
+    try:
+        folder = user_upload_folder
+        json_paths = glob.glob(f"{folder}/*.json")
+        for json_path in json_paths:
+            base = os.path.splitext(os.path.basename(json_path))[0]
+            index_path = os.path.join(folder, f"{base}.index")
+            if not os.path.exists(index_path):
+                continue
+
+            with open(json_path, "r", encoding="utf-8") as f:
+                chunks_list = json.load(f)
+
+            idx = faiss.read_index(index_path)
+            with _FAISS_LOCK:
+                D, I = idx.search(np.array([qvec]).astype("float32"), k=k_per_doc_upload)
+
+            for dist, ci in zip(D[0], I[0]):
+                if 0 <= ci < len(chunks_list):
+                    c = (chunks_list[ci] or "").strip()
+                    if c:
+                        scored.append((float(dist), c, f"upload:{base}"))
+    except Exception as e:
+        if debug:
+            print("[RAG][DEBUG] upload search error:", e)
+
+    if not scored:
+        return [], []
+
+    scored.sort(key=lambda x: x[0])
+
+    chunks: List[str] = []
+    sources: List[str] = []
+    seen_chunks = set()
+    seen_src = set()
+
+    for dist, c, src in scored:
+        if not c or c in seen_chunks:
+            continue
+        seen_chunks.add(c)
+
+        if len(c) > chunk_max_chars:
+            c = c[:chunk_max_chars].rstrip() + "…"
+
+        chunks.append(c)
+
+        if src and src not in seen_src:
+            seen_src.add(src)
+            sources.append(src)
+
+        if len(chunks) >= max_total:
+            break
+
+    if debug:
+        print("[RAG][DEBUG] tier:", tier, "chunks:", len(chunks), "sources:", sources)
+
+    return chunks, sources
 
 
 # =========================
-# SharePoint sync
-# =========================
-def log_sync_activity(filename: str, user_name: str, user_email: str):
-    ts = datetime.datetime.utcnow().isoformat()
-    with open(HISTORY_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{ts},{filename},{user_name},{user_email}\n")
-
-
-def sync_sharepoint():
-    internal_subfolder = "Internal"
-    public_subfolder = "Public"
-
-    access_token = authenticate()
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    def list_files(sub_path: str):
-        full_path = f"{FOLDER_PATH}/{sub_path}".replace(" ", "%20")
-        url = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{full_path}:/children"
-        resp = requests.get(url, headers=headers, timeout=60)
-        resp.raise_for_status()
-        return resp.json().get("value", [])
-
-    internal_files = list_files(internal_subfolder)
-    public_files = list_files(public_subfolder)
-    all_files = [(f, "internal") for f in internal_files] + [(f, "public") for f in public_files]
-
-    for file, access_level in all_files:
-        name = file.get("name")
-        if not name:
-            continue
-
-        ext = name.lower().split(".")[-1]
-        if ext not in ["pdf", "docx", "txt"]:
-            print(f"Skipping unsupported file: {name}")
-            continue
-
-        base_name = os.path.splitext(name)[0]
-        subfolder = Path(DESTINATION_FOLDER) / access_level
-        subfolder.mkdir(parents=True, exist_ok=True)
-
-        json_path = subfolder / f"{base_name}.json"
-        index_path = subfolder / f"{base_name}.index"
-
-        # Skip already processed
-        if json_path.exists() and index_path.exists():
-            continue
-
-        print(f"Downloading: {name}")
-        download_url = file.get("@microsoft.graph.downloadUrl")
-        if not download_url:
-            print(f"Missing download URL for: {name}")
-            continue
-
-        file_data = requests.get(download_url, timeout=120)
-        file_data.raise_for_status()
-
-        dest_path = subfolder / name
-        with open(dest_path, "wb") as f:
-            f.write(file_data.content)
-
-        text = extract_text(name, file_data.content)
-        chunks = chunk_text(text)
-
-        if not chunks:
-            print(f"No text extracted for: {name}")
-            continue
-
-        vectors = embed_texts(chunks)
-        if not vectors:
-            print(f"[WARN] No embeddings generated for {name}, skipping file")
-            continue
-
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(chunks, f)
-
-        index = faiss.IndexFlatL2(VECTOR_DIM)
-        index.add(np.array(vectors).astype("float32"))
-        faiss.write_index(index, str(index_path))
-
-        user_info = file.get("createdBy", {}).get("user", {})
-        user_name = user_info.get("displayName", "Unknown")
-        user_email = user_info.get("email", "Unknown")
-        log_sync_activity(name, user_name, user_email)
-
-    print("Sync complete. Files processed and saved to ./documents/")
-
-
-
-
-# =========================
-# FastAPI
+# FastAPI app
 # =========================
 app = FastAPI()
+
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 if not SESSION_SECRET:
     raise RuntimeError("Missing SESSION_SECRET env var")
@@ -414,7 +577,20 @@ app.add_middleware(
     https_only=True,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+app.include_router(estimator_router)
+
+
+# =========================
+# Auth endpoints
+# =========================
 @app.post("/auth/login")
 def auth_login(email: str = Form(...), password: str = Form(...)):
     email_lc = (email or "").strip().lower()
@@ -427,41 +603,6 @@ def auth_login(email: str = Form(...), password: str = Form(...)):
 
     token = issue_sso_token(email_lc)
     return {"token": token, "email": email_lc}
-
-
-from urllib.parse import urlparse
-
-FRONTEND_ORIGINS = [
-    "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
-]
-
-def _is_allowed_next(url: str) -> bool:
-    try:
-        u = urlparse(url)
-        if u.scheme != "https":
-            return False
-        origin = f"{u.scheme}://{u.netloc}"
-        return origin in FRONTEND_ORIGINS
-    except Exception:
-        return False
-
-from fastapi import Query
-from urllib.parse import urlparse
-
-FRONTEND_ORIGINS = [
-    "https://docqa-frontend-git-main-antoine-lauwens-projects.vercel.app",
-    # plus tard: "https://portal.shiperp.com",
-]
-
-def _is_allowed_next(url: str) -> bool:
-    try:
-        u = urlparse(url)
-        if u.scheme != "https":
-            return False
-        origin = f"{u.scheme}://{u.netloc}"
-        return origin in FRONTEND_ORIGINS
-    except Exception:
-        return False
 
 @app.get("/sso")
 def sso_entry(
@@ -481,19 +622,10 @@ def sso_entry(
     request.session["user_email"] = email
     return RedirectResponse(url=next_url, status_code=HTTP_303_SEE_OTHER)
 
-
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "docqa-api"}
-
-
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
     return {"ok": True}
-
 
 @app.get("/me")
 def me(request: Request):
@@ -503,27 +635,16 @@ def me(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return {"email": email, "tier": tier}
 
-app.include_router(estimator_router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-
-sync_in_progress = False
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "docqa-api"}
 
 
 # =========================
-# Upload (public)
+# Upload (private per-user)
 # =========================
 @app.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
-    # Require logged-in session
     email = (request.session.get("user_email") or "").strip().lower()
     tier = get_user_tier(email)
     if not tier:
@@ -543,143 +664,76 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         if not vectors:
             return JSONResponse({"error": "No valid text to embed in this document."}, status_code=400)
 
-        # Private per-user folder
-        safe_email = (
-            email.replace("@", "_at_")
-                 .replace(".", "_")
-                 .replace("/", "_")
-                 .replace("\\", "_")
-        )
-        subfolder = Path(DESTINATION_FOLDER) / "uploads" / safe_email
-        subfolder.mkdir(parents=True, exist_ok=True)
+        safe_email = _safe_email_folder(email)
+        user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
+        os.makedirs(user_upload_folder, exist_ok=True)
 
-        json_path = subfolder / f"{document_name}.json"
-        index_path = subfolder / f"{document_name}.index"
+        json_path = os.path.join(user_upload_folder, f"{document_name}.json")
+        index_path = os.path.join(user_upload_folder, f"{document_name}.index")
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
 
-        index = faiss.IndexFlatL2(VECTOR_DIM)
-        index.add(np.array(vectors).astype("float32"))
-        faiss.write_index(index, str(index_path))
+        idx = faiss.IndexFlatL2(VECTOR_DIM)
+        idx.add(np.array(vectors).astype("float32"))
+        faiss.write_index(idx, index_path)
 
-        clear_index_cache()
         return {"message": f"Document '{document_name}' uploaded privately for {email}."}
 
     except Exception as e:
         print("Upload failed:", str(e))
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 # =========================
-# Sync now (background)
+# Sync now (download-only; indexing is separate)
 # =========================
+sync_in_progress = False
+
 @app.post("/sync-now")
 def trigger_sync(background_tasks: BackgroundTasks):
+    """
+    Downloads updated docs from SharePoint into /data/documents/{tier}.
+    NOTE: Does NOT build /data/indexes/...; run build_index.py separately.
+    """
     global sync_in_progress
     if sync_in_progress:
         return {"status": "busy", "message": "Sync already in progress."}
 
     sync_in_progress = True
 
+    # you can override these via env:
+    SP_PUBLIC_SUBPATH = os.getenv("SP_PUBLIC_SUBPATH", "public")
+    SP_INTERNAL_SUBPATH = os.getenv("SP_INTERNAL_SUBPATH", "internal")
+
     def run_and_release():
         global sync_in_progress
         try:
-            sync_sharepoint()
+            # public
+            sync_sharepoint_download_only(
+                tier="public",
+                sp_subpath=SP_PUBLIC_SUBPATH,
+                dest_root=DESTINATION_FOLDER,
+                allowed_exts=["pdf", "docx", "txt"],
+            )
+            # internal
+            sync_sharepoint_download_only(
+                tier="internal",
+                sp_subpath=SP_INTERNAL_SUBPATH,
+                dest_root=DESTINATION_FOLDER,
+                allowed_exts=["pdf", "docx", "txt"],
+            )
+        except Exception as e:
+            print("[SYNC ERROR]", str(e))
         finally:
             sync_in_progress = False
-            clear_index_cache()
 
     background_tasks.add_task(run_and_release)
-    return {"status": "started", "message": "SharePoint sync started in background."}
+    return {"status": "started", "message": "SharePoint download sync started in background."}
 
 
 # =========================
-# Retrieve (with sources)
-# =========================
-def retrieve_chunks_with_sources(
-    question: str,
-    access_folders: List[str],
-    k_per_doc: int = 6,
-    max_total: int = 12,
-    chunk_max_chars: int = 1200,
-    debug: bool = False,
-) -> Tuple[List[str], List[str]]:
-    """Return best chunks + unique source doc basenames."""
-    question = (question or "").strip()
-    if not question:
-        return [], []
-
-    qvecs = embed_texts([question])
-    if not qvecs:
-        return [], []
-    qvec = qvecs[0]
-
-    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, doc_base)
-
-    for folder in access_folders:
-        json_paths = glob.glob(f"{folder}/*.json")
-        for json_path in json_paths:
-            base = os.path.splitext(os.path.basename(json_path))[0]
-            index_path = os.path.join(folder, f"{base}.index")
-            if not os.path.exists(index_path):
-                continue
-
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    chunks_list = json.load(f)
-                index = faiss.read_index(index_path)
-            except Exception as e:
-                if debug:
-                    print("[RAG][DEBUG] failed loading:", json_path, "err:", e)
-                continue
-
-            D, I = index.search(np.array([qvec]).astype("float32"), k=k_per_doc)
-            for dist, idx in zip(D[0], I[0]):
-                if 0 <= idx < len(chunks_list):
-                    c = (chunks_list[idx] or "").strip()
-                    if c:
-                        scored.append((float(dist), c, base))
-
-    if not scored:
-        return [], []
-
-    scored.sort(key=lambda x: x[0])
-
-    seen_chunks = set()
-    chunks: List[str] = []
-    sources_ordered: List[str] = []
-
-    for dist, c, doc_base in scored:
-        if c in seen_chunks:
-            continue
-        seen_chunks.add(c)
-
-        if len(c) > chunk_max_chars:
-            c = c[:chunk_max_chars].rstrip() + "…"
-
-        chunks.append(c)
-        sources_ordered.append(doc_base)
-
-        if len(chunks) >= max_total:
-            break
-
-    uniq_sources: List[str] = []
-    seen_src = set()
-    for s in sources_ordered:
-        if s and s not in seen_src:
-            seen_src.add(s)
-            uniq_sources.append(s)
-
-    if debug:
-        print("[RAG][DEBUG] question:", question)
-        print("[RAG][DEBUG] access_folders:", access_folders)
-        print("[RAG][DEBUG] chunks:", len(chunks), "sources:", uniq_sources)
-
-    return chunks, uniq_sources
-
-
-# =========================
-# One-shot QA (/ask) - docs-first + fallback (stable)
+# One-shot QA (/ask)
 # =========================
 @app.post("/ask")
 def ask_question(
@@ -695,25 +749,16 @@ def ask_question(
         if not tier:
             return JSONResponse({"error": "Access denied"}, status_code=403)
 
-        safe_email = (
-            email_lc.replace("@", "_at_")
-                    .replace(".", "_")
-                    .replace("/", "_")
-                    .replace("\\", "_")
-        )
-        user_upload_folder = f"documents/uploads/{safe_email}"
-
-        if tier == "internal":
-            access_folders = ["documents/public", "documents/internal", user_upload_folder]
-        elif tier == "public":
-            access_folders = ["documents/public", user_upload_folder]
-        else:
-            return JSONResponse({"error": "Access denied"}, status_code=403)
+        safe_email = _safe_email_folder(email_lc)
+        user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
+        os.makedirs(user_upload_folder, exist_ok=True)
 
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
-            access_folders=access_folders,
-            k_per_doc=8,
+            tier=tier,
+            user_upload_folder=user_upload_folder,
+            k_public_internal=18,
+            k_per_doc_upload=6,
             max_total=12,
             chunk_max_chars=1200,
             debug=debug,
@@ -769,13 +814,10 @@ CHAT_MAX_TURNS = 12
 CHAT_SUMMARY_TRIGGER = 18
 CHAT_CONTEXT_CHAR_BUDGET = 14000
 
-# In-memory store (resets on restart)
-CHAT_STORE: Dict[str, Dict[str, Any]] = {}
-
+CHAT_STORE: Dict[str, Dict[str, Any]] = {}  # in-memory, resets on restart
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
-
 
 def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
     out = []
@@ -791,12 +833,10 @@ def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[di
         total += size
     return list(reversed(out))
 
-
 def _get_user_state(user_id: str) -> Dict[str, Any]:
     if user_id not in CHAT_STORE:
         CHAT_STORE[user_id] = {"summary": "", "messages": []}
     return CHAT_STORE[user_id]
-
 
 def _summarize_if_needed(user_id: str):
     state = _get_user_state(user_id)
@@ -839,7 +879,6 @@ Update the summary. Keep it factual and concise. Preserve decisions, constraints
 
     state["messages"] = keep
 
-
 @app.post("/chat-api")
 async def chat_api(
     request: Request,
@@ -853,28 +892,16 @@ async def chat_api(
 
     user_id = email
 
-    # ---- include per-user uploads folder ----
-    safe_email = (
-        email.replace("@", "_at_")
-             .replace(".", "_")
-             .replace("/", "_")
-             .replace("\\", "_")
-    )
-    user_upload_folder = f"documents/uploads/{safe_email}"
-    
-    if tier == "internal":
-        access_folders = ["documents/public", "documents/internal", user_upload_folder]
-    elif tier == "public":
-        access_folders = ["documents/public", user_upload_folder]
-    else:
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+    message = (message or "").strip()
+    if not message:
+        return JSONResponse({"error": "Empty message"}, status_code=400)
+
+    safe_email = _safe_email_folder(email)
+    user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
+    os.makedirs(user_upload_folder, exist_ok=True)
 
     try:
         import re
-
-        message = (message or "").strip()
-        if not message:
-            return JSONResponse({"error": "Empty message"}, status_code=400)
 
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
@@ -924,8 +951,10 @@ async def chat_api(
 
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=message,
-            access_folders=access_folders,
-            k_per_doc=6,
+            tier=tier,
+            user_upload_folder=user_upload_folder,
+            k_public_internal=18,
+            k_per_doc_upload=6,
             max_total=12,
             chunk_max_chars=1200,
             debug=debug,
@@ -958,10 +987,7 @@ async def chat_api(
             out_sources = []
         else:
             out_sources = uniq_sources if has_docs else []
-            if out_sources:
-                final_answer = answer.rstrip() + "\n\nSources: " + ", ".join(out_sources)
-            else:
-                final_answer = answer
+            final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
 
         state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
 
@@ -972,14 +998,12 @@ async def chat_api(
         if debug:
             payload["has_docs"] = has_docs
             payload["model"] = CHAT_MODEL
+            payload["tier"] = tier
 
         return payload
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
-
 
 
 # =========================
@@ -1008,7 +1032,6 @@ def admin_dashboard(request: Request):
         </form>
     """
 
-
 @app.post("/admin/add")
 def add_internal_user(request: Request, email: str = Form(...)):
     require_internal(request)
@@ -1016,9 +1039,7 @@ def add_internal_user(request: Request, email: str = Form(...)):
     INTERNAL_USERS[email] = True
     with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
         json.dump(INTERNAL_USERS, f, indent=2)
-    clear_index_cache()
     return HTMLResponse(f"<p>{email} added as internal user. <a href='/admin'>Back</a></p>")
-
 
 @app.post("/admin/remove")
 def remove_internal_user(request: Request, email: str = Form(...)):
@@ -1028,7 +1049,6 @@ def remove_internal_user(request: Request, email: str = Form(...)):
         del INTERNAL_USERS[email]
         with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
             json.dump(INTERNAL_USERS, f, indent=2)
-        clear_index_cache()
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
@@ -1046,7 +1066,6 @@ def post_to_slack(response_url: str, text: str):
     except Exception as e:
         print("[DEBUG][SLACK] error posting follow-up:", e)
 
-
 def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
     try:
@@ -1054,10 +1073,8 @@ def process_slack_question(question: str, response_url: str):
         text = result.get("answer") or result.get("error") or "No answer."
     except Exception as e:
         text = f"Error while processing: {str(e)}"
-
     if response_url:
         post_to_slack(response_url, text)
-
 
 @app.post("/ask-from-slack")
 async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
@@ -1072,16 +1089,40 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
 
 
 # =========================
-# Startup sync
+# Startup
 # =========================
 @app.on_event("startup")
 async def startup_event():
+    # Default: disabled (avoids surprise memory spikes / restarts)
+    if os.getenv("DISABLE_STARTUP_SYNC", "1") == "1":
+        print("Startup sync disabled.")
+        return
+
     async def _run():
         try:
-            print("Running SharePoint sync on startup (background)...")
-            await asyncio.to_thread(sync_sharepoint)
-            clear_index_cache()
-            print("Startup sync finished.")
+            print("Running SharePoint download sync on startup (background)...")
+            # Optional: you can set SP_PUBLIC_SUBPATH/SP_INTERNAL_SUBPATH via env
+            sp_public = os.getenv("SP_PUBLIC_SUBPATH", "public")
+            sp_internal = os.getenv("SP_INTERNAL_SUBPATH", "internal")
+
+            await asyncio.to_thread(
+                sync_sharepoint_download_only,
+                "public",
+                sp_public,
+                DESTINATION_FOLDER,
+                ["pdf", "docx", "txt"],
+                None,
+            )
+            await asyncio.to_thread(
+                sync_sharepoint_download_only,
+                "internal",
+                sp_internal,
+                DESTINATION_FOLDER,
+                ["pdf", "docx", "txt"],
+                None,
+            )
+
+            print("Startup download sync finished.")
         except Exception as e:
             import traceback
             print("Startup sync failed:", repr(e))
@@ -1089,6 +1130,3 @@ async def startup_event():
 
     asyncio.create_task(_run())
     print("Startup complete (sync scheduled).")
-
-
-
