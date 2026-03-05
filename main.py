@@ -996,10 +996,14 @@ async def chat_api(
     os.makedirs(user_upload_folder, exist_ok=True)
 
     # --- Index presence diagnostics (critical for consolidated RAG) ---
-    public_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index")) and \
-                           os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
-    internal_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index")) and \
-                             os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
+    public_index_present = (
+        os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index"))
+        and os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
+    )
+    internal_index_present = (
+        os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index"))
+        and os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
+    )
 
     try:
         import re
@@ -1088,8 +1092,8 @@ async def chat_api(
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
-                if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
-            # same guard for conversational endpoint
+        # --- Guard: if we HAVE docs but model still outputs fallback marker, force strict doc-only pass ---
+        if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
             answer = answer_from_docs_strict(question=message, docs_block=docs_block, max_tokens=900)
 
         # --- Final formatting ---
@@ -1117,6 +1121,8 @@ async def chat_api(
                     "sources_preview": uniq_sources[:10],
                     "public_index_present": public_index_present,
                     "internal_index_present": internal_index_present,
+                    # super helpful to see what the model actually got:
+                    "docs_preview": chunks[:3],
                 }
             )
 
@@ -1124,7 +1130,6 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 # =========================
 # Admin pages
