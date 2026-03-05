@@ -1074,13 +1074,62 @@ def post_to_slack(response_url: str, text: str):
     except Exception as e:
         print("[DEBUG][SLACK] error posting follow-up:", e)
 
+
 def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
+
     try:
-        result = retrieve_chunks_with_sources(question=question, user_email=user_email, debug=False)
-        text = result.get("answer") or result.get("error") or "No answer."
+        tier = get_user_tier(user_email)
+        if not tier:
+            text = "Unauthorized user."
+        else:
+            safe_email = _safe_email_folder(user_email)
+            user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
+            os.makedirs(user_upload_folder, exist_ok=True)
+
+            chunks, sources = retrieve_chunks_with_sources(
+                question=question,
+                tier=tier,
+                user_upload_folder=user_upload_folder,
+                k_public_internal=18,
+                k_per_doc_upload=6,
+                max_total=12,
+                chunk_max_chars=1200,
+                debug=False,
+            )
+
+            has_docs = bool(chunks)
+            docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+
+            system_rules = (
+                "You are the ShipERP assistant.\n"
+                "You must answer FIRST using the documentation excerpts provided below.\n"
+                "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+                "If the documentation does NOT contain the answer, say explicitly:\n"
+                '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
+                "Only then, provide a concise general-knowledge answer.\n"
+                "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+                "Be practical and sufficiently detailed to be useful.\n"
+                "Do NOT include any 'Sources' section in your answer."
+            )
+
+            messages = [
+                {"role": "system", "content": system_rules},
+                {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+                {"role": "user", "content": (question or "").strip()},
+            ]
+
+            answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
+
+            # Optional: add sources only when docs were used (same behavior as /ask)
+            if answer.lower().startswith(FALLBACK_MARKER) or not has_docs:
+                text = answer
+            else:
+                text = answer.rstrip() + "\n\nSources: " + ", ".join(sources)
+
     except Exception as e:
         text = f"Error while processing: {str(e)}"
+
     if response_url:
         post_to_slack(response_url, text)
 
@@ -1090,10 +1139,14 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     question = (form.get("text") or "").strip()
     response_url = form.get("response_url")
 
+    if not question:
+        return {"response_type": "ephemeral", "text": "Please provide a question after the command."}
+
+    # Always ack quickly, then do the heavy work async
     if response_url:
         background_tasks.add_task(process_slack_question, question, response_url)
 
-    return {"response_type": "ephemeral", "text": "Got it, I’m generating an answer…"}
+    return {"response_type": "ephemeral", "text": "Got it — working on it…"}
 
 
 # =========================
