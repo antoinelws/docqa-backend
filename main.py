@@ -143,8 +143,6 @@ def verify_password(email: str, password: str) -> bool:
 # =========================
 # OpenAI client + wrappers (SDK v2.x)
 # =========================
-
-
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
     resp = _openai_client.chat.completions.create(
         model=model,
@@ -273,6 +271,8 @@ def keyword_chunks_from_consolidated(tier: str, needle: str, limit: int = 8) -> 
         return [(r[0] or "", r[1] or "") for r in cur.fetchall() if r and r[1]]
     finally:
         conn.close()
+
+
 # =========================
 # SSO tokens
 # =========================
@@ -424,7 +424,7 @@ def sync_sharepoint_download_only(
 # =========================
 # Upload parsing + chunking (uploads only)
 # =========================
-def extract_text(filename: str, content: bytes) -> str:
+def extract_text_upload(filename: str, content: bytes) -> str:
     ext = (filename or "").lower().split(".")[-1]
 
     if ext == "pdf":
@@ -504,27 +504,32 @@ def retrieve_chunks_with_sources(
         return [], []
     qvec = qvecs[0]
 
-    # scored must exist BEFORE any append
     scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
 
-    # --- Keyword anti-regression (acronyms like ShipERP) ---
+    # --- Keyword anti-regression (ShipERP variants) ---
     q_lc = question.lower()
-    if "shiperp" in q_lc:
-        try:
-            rows = keyword_chunks_from_consolidated("public", "shiperp", limit=10)
-            for fp, ch in rows:
-                src = os.path.basename(fp) if fp else "unknown"
-                ch = (ch or "").strip()
-                if ch:
-                    scored.append((-1.0, ch, src))
+    needles: List[str] = []
+    if ("shiperp" in q_lc) or ("ship erp" in q_lc) or ("ship-erp" in q_lc):
+        needles = ["shiperp", "ship erp", "ship-erp"]
 
-            if tier == "internal":
-                rows = keyword_chunks_from_consolidated("internal", "shiperp", limit=10)
+    if needles:
+        try:
+            for needle in needles:
+                rows = keyword_chunks_from_consolidated("public", needle, limit=10)
                 for fp, ch in rows:
                     src = os.path.basename(fp) if fp else "unknown"
                     ch = (ch or "").strip()
                     if ch:
                         scored.append((-1.0, ch, src))
+
+            if tier == "internal":
+                for needle in needles:
+                    rows = keyword_chunks_from_consolidated("internal", needle, limit=10)
+                    for fp, ch in rows:
+                        src = os.path.basename(fp) if fp else "unknown"
+                        ch = (ch or "").strip()
+                        if ch:
+                            scored.append((-1.0, ch, src))
         except Exception as e:
             if debug:
                 print("[RAG][DEBUG] keyword fallback error:", e)
@@ -691,7 +696,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         document_name = os.path.splitext(filename)[0] or "document"
 
         content = await file.read()
-        text = extract_text(filename, content)
+        text = extract_text_upload(filename, content)
         chunks = chunk_text(text)
         if not chunks:
             return JSONResponse({"error": "No text extracted from uploaded file."}, status_code=400)
@@ -785,6 +790,12 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
         user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
         os.makedirs(user_upload_folder, exist_ok=True)
 
+        # --- Index presence diagnostics (critical for consolidated RAG) ---
+        public_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index")) and \
+                               os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
+        internal_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index")) and \
+                                 os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
+
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
             tier=tier,
@@ -820,17 +831,39 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
         if answer.lower().startswith(FALLBACK_MARKER):
-            return {"answer": answer, "sources": []}
+            payload: Dict[str, Any] = {"answer": answer, "sources": []}
+            if debug:
+                payload.update(
+                    {
+                        "has_docs": has_docs,
+                        "model": MODEL_BIG,
+                        "tier": tier,
+                        "user_upload_folder": user_upload_folder,
+                        "public_index_present": public_index_present,
+                        "internal_index_present": internal_index_present,
+                        "chunks_count": len(chunks),
+                        "sources_preview": sources[:10],
+                    }
+                )
+            return payload
 
         out_sources = sources if has_docs else []
         final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
 
         payload: Dict[str, Any] = {"answer": final_answer, "sources": out_sources}
         if debug:
-            payload["has_docs"] = has_docs
-            payload["model"] = MODEL_BIG
-            payload["tier"] = tier
-            payload["user_upload_folder"] = user_upload_folder
+            payload.update(
+                {
+                    "has_docs": has_docs,
+                    "model": MODEL_BIG,
+                    "tier": tier,
+                    "user_upload_folder": user_upload_folder,
+                    "public_index_present": public_index_present,
+                    "internal_index_present": internal_index_present,
+                    "chunks_count": len(chunks),
+                    "sources_preview": sources[:10],
+                }
+            )
 
         return payload
 
@@ -934,6 +967,12 @@ async def chat_api(
     safe_email = _safe_email_folder(email)
     user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
     os.makedirs(user_upload_folder, exist_ok=True)
+
+    # --- Index presence diagnostics (critical for consolidated RAG) ---
+    public_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index")) and \
+                           os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
+    internal_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index")) and \
+                             os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
 
     try:
         import re
@@ -1045,6 +1084,8 @@ async def chat_api(
                     "user_upload_folder": user_upload_folder,
                     "chunks_count": len(chunks),
                     "sources_preview": uniq_sources[:10],
+                    "public_index_present": public_index_present,
+                    "internal_index_present": internal_index_present,
                 }
             )
 
@@ -1052,7 +1093,8 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-        
+
+
 # =========================
 # Admin pages
 # =========================
@@ -1077,6 +1119,8 @@ def admin_dashboard(request: Request):
             <input name='email' placeholder='Remove user email' required>
             <button type='submit'>Remove User</button>
         </form>
+        <hr>
+        <p><a href="/admin/index-health">Index health (public/internal)</a></p>
     """
 
 @app.post("/admin/add")
@@ -1099,6 +1143,38 @@ def remove_internal_user(request: Request, email: str = Form(...)):
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
 
+@app.get("/admin/index-health")
+def index_health(request: Request):
+    require_internal(request)
+    out: Dict[str, Any] = {}
+
+    for t in ("public", "internal"):
+        idx_dir = Path(INDEXES_FOLDER) / t
+        faiss_path = idx_dir / "faiss.index"
+        db_path = idx_dir / "meta.db"
+        info: Dict[str, Any] = {
+            "faiss_exists": faiss_path.exists(),
+            "meta_exists": db_path.exists(),
+        }
+
+        if db_path.exists():
+            try:
+                conn = sqlite3.connect(str(db_path))
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM chunks")
+                info["chunks_count"] = int(cur.fetchone()[0])
+            except Exception as e:
+                info["chunks_count_error"] = repr(e)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        out[t] = info
+
+    return out
+
 
 # =========================
 # Slack integration
@@ -1112,7 +1188,6 @@ def post_to_slack(response_url: str, text: str):
         )
     except Exception as e:
         print("[DEBUG][SLACK] error posting follow-up:", e)
-
 
 def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
