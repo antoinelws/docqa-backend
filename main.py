@@ -808,20 +808,18 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
         )
 
         has_docs = bool(chunks)
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        docs_block = "\n\n".join(chunks) if chunks else "(none found for this question)"
 
         system_rules = (
             "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
+            "Answer the question using ONLY the documentation excerpts below.\n\n"
+            "If the documentation excerpts contain relevant information, you MUST base your answer on them.\n"
+            "Do not say that the documentation is missing if relevant excerpts are provided.\n\n"
+            "If the documentation truly contains nothing relevant, say:\n"
             '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
-            "Only then, provide a concise general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Be practical and sufficiently detailed to be useful.\n"
-            "Do NOT include any 'Sources' section in your answer."
+            "Then give a concise answer.\n"
+            "Do not include a 'Sources' section."
         )
-
         messages = [
             {"role": "system", "content": system_rules},
             {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
