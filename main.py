@@ -151,6 +151,29 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
     )
     return (resp.choices[0].message.content or "").strip()
 
+def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 700) -> str:
+    """
+    Strong guard: if docs are provided, the assistant must NOT claim they are missing.
+    If it cannot answer, it should say 'I can't find it in the provided excerpts.' (no general knowledge).
+    """
+    system_rules = (
+        "You are the ShipERP assistant.\n"
+        "You are given documentation excerpts. They are the ONLY allowed source.\n"
+        "Do NOT say the documentation is missing if any excerpts are provided.\n"
+        "Answer using ONLY the excerpts.\n"
+        "If you truly cannot answer from the excerpts, say exactly:\n"
+        "\"I can't find this in the provided excerpts.\"\n"
+        "Do not add general knowledge.\n"
+        "Do not include a Sources section.\n"
+    )
+
+    messages = [
+        {"role": "system", "content": system_rules},
+        {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
+        {"role": "user", "content": question},
+    ]
+    return chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=max_tokens)
+
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     clean_texts: List[str] = []
     for t in texts:
@@ -828,6 +851,12 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
+
+        # --- Guard: if we HAVE docs but model still claims "docs missing", force strict second pass ---
+        if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
+            # Re-run with a prompt that forbids claiming docs are missing and forbids general knowledge
+            answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=700)
+            
         if answer.lower().startswith(FALLBACK_MARKER):
             payload: Dict[str, Any] = {"answer": answer, "sources": []}
             if debug:
@@ -1058,6 +1087,10 @@ async def chat_api(
         messages.extend(recent)
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
+
+                if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
+            # same guard for conversational endpoint
+            answer = answer_from_docs_strict(question=message, docs_block=docs_block, max_tokens=900)
 
         # --- Final formatting ---
         if (answer or "").lower().startswith(FALLBACK_MARKER):
