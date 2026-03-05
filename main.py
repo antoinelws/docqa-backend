@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 
 from openai import OpenAI
-client = OpenAI()
+_openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 from sow_estimator import router as estimator_router
 
@@ -146,7 +146,7 @@ def verify_password(email: str, password: str) -> bool:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
-    resp = client.chat.completions.create(
+    resp = _openai_client.chat.completions.create(
         model=model,
         messages=messages,
         max_completion_tokens=max_completion_tokens,
@@ -172,7 +172,10 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     for i in range(0, len(clean_texts), batch_size):
         batch = clean_texts[i : i + batch_size]
         try:
-            resp = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            resp = _openai_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=batch,
+            )
             vectors.extend([d.embedding for d in resp.data])
         except Exception as e:
             print("[EMBEDDING ERROR] batch skipped:", repr(e))
