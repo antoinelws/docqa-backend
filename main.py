@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 
 from openai import OpenAI
+client = OpenAI()
 
 from sow_estimator import router as estimator_router
 
@@ -142,25 +143,18 @@ def verify_password(email: str, password: str) -> bool:
 # =========================
 # OpenAI client + wrappers (SDK v2.x)
 # =========================
-_openai_client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
-    """
-    OpenAI SDK v2: client.chat.completions.create
-    """
-    resp = _openai_client.chat.completions.create(
+    resp = client.chat.completions.create(
         model=model,
         messages=messages,
         max_completion_tokens=max_completion_tokens,
     )
-    out = resp.choices[0].message.content or ""
-    return out.strip()
+    return (resp.choices[0].message.content or "").strip()
 
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
-    """
-    Safe embedding batching. Truncates long inputs and skips empty strings.
-    """
-    clean: List[str] = []
+    clean_texts: List[str] = []
     for t in texts:
         if not isinstance(t, str):
             continue
@@ -169,19 +163,19 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
             continue
         if len(t) > 6000:
             t = t[:6000]
-        clean.append(t)
+        clean_texts.append(t)
 
-    if not clean:
+    if not clean_texts:
         return []
 
     vectors: List[List[float]] = []
-    for i in range(0, len(clean), batch_size):
-        batch = clean[i : i + batch_size]
+    for i in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[i : i + batch_size]
         try:
-            resp = _openai_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            resp = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
             vectors.extend([d.embedding for d in resp.data])
         except Exception as e:
-            print("[EMBEDDING ERROR] batch skipped:", str(e))
+            print("[EMBEDDING ERROR] batch skipped:", repr(e))
     return vectors
 
 
