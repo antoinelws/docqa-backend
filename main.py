@@ -29,9 +29,6 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 
-from openai import OpenAI
-_openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 from sow_estimator import router as estimator_router
 
 
@@ -47,6 +44,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
+    
+from openai import OpenAI
+
+# après load_dotenv() et OPENAI_API_KEY = os.getenv(...)
+_openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Models
 MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
@@ -798,9 +800,6 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-print("DEBUG tier:", tier)
-print("DEBUG chunks:", len(chunks))
-print("DEBUG sources:", sources[:5])
 
 # =========================
 # Conversation (per-user) + RAG
@@ -895,7 +894,7 @@ async def chat_api(
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
     # --- Per-user uploads folder ---
-    safe_email = _safe_email_folder(email)  # assure-toi que cette fonction existe
+    safe_email = _safe_email_folder(email)
     user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
     os.makedirs(user_upload_folder, exist_ok=True)
 
@@ -907,7 +906,7 @@ async def chat_api(
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
         _summarize_if_needed(user_id)
 
-        # --- Special case: “what was my first question?” etc ---
+        # --- Special case: chat memory questions ---
         msg_lc = message.lower().strip()
 
         def is_chat_memory_question(s: str) -> bool:
@@ -935,7 +934,6 @@ async def chat_api(
                 for m in state.get("messages", [])
                 if m.get("role") == "user" and (m.get("content") or "").strip()
             ]
-            # enlever le message courant
             if user_msgs and user_msgs[-1].lower() == message.lower():
                 user_msgs = user_msgs[:-1]
 
@@ -952,10 +950,10 @@ async def chat_api(
         summary = (state.get("summary") or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # --- RAG retrieval (NEW consolidated + uploads) ---
+        # --- RAG retrieval (public always; +internal if tier=internal) ---
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=message,
-            tier=tier,
+            tier=tier,  # internal => public+internal ; public => public only (handled inside retrieve)
             user_upload_folder=user_upload_folder,
             k_public_internal=18,
             k_per_doc_upload=6,
@@ -1008,8 +1006,8 @@ async def chat_api(
                     "has_docs": has_docs,
                     "tier": tier,
                     "user_upload_folder": user_upload_folder,
-                    "sources_preview": uniq_sources[:10],
                     "chunks_count": len(chunks),
+                    "sources_preview": uniq_sources[:10],
                 }
             )
 
@@ -1017,7 +1015,7 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
+        
 # =========================
 # Admin pages
 # =========================
