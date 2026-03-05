@@ -252,7 +252,27 @@ def search_consolidated(tier: str, qvec: List[float], k: int = 12) -> List[Tuple
         scored.append((dist, (chunk or "").strip(), src))
     return scored
 
+def keyword_chunks_from_consolidated(tier: str, needle: str, limit: int = 8) -> List[Tuple[str, str]]:
+    """
+    Keyword fallback: fetch chunks that literally contain 'needle' (case-insensitive)
+    from the consolidated sqlite meta.db for a given tier.
+    Returns list of (file, chunk).
+    """
+    needle = (needle or "").strip().lower()
+    if not needle:
+        return []
 
+    _idx, db_path = load_consolidated_index(tier)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT file, chunk FROM chunks WHERE lower(chunk) LIKE ? LIMIT ?",
+            (f"%{needle}%", int(limit)),
+        )
+        return [(r[0] or "", r[1] or "") for r in cur.fetchall() if r and r[1]]
+    finally:
+        conn.close()
 # =========================
 # SSO tokens
 # =========================
@@ -488,6 +508,23 @@ def retrieve_chunks_with_sources(
         return [], []
     qvec = qvecs[0]
 
+        # --- Keyword anti-regression (acronyms like ShipERP) ---
+    q_lc = question.lower()
+    keyword_boost_chunks: List[Tuple[str, str, str]] = []  # (chunk, src, tier)
+    if "shiperp" in q_lc:
+        rows = keyword_chunks_from_consolidated("public", "shiperp", limit=10)
+        for fp, ch in rows:
+            src = os.path.basename(fp) if fp else "unknown"
+            if ch.strip():
+                # dist=-1 to force top
+                scored.append((-1.0, ch.strip(), src))
+
+        if tier == "internal":
+            rows = keyword_chunks_from_consolidated("internal", "shiperp", limit=10)
+            for fp, ch in rows:
+                src = os.path.basename(fp) if fp else "unknown"
+                if ch.strip():
+                    scored.append((-1.0, ch.strip(), src))
     scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
 
     # 1) consolidated public/internal
