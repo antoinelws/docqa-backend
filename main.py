@@ -1077,7 +1077,7 @@ def post_to_slack(response_url: str, text: str):
 def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
     try:
-        result = ask_question(question=question, user_email=user_email, debug=False)
+        result = retrieve_chunks_with_sources(question=question, user_email=user_email, debug=False)
         text = result.get("answer") or result.get("error") or "No answer."
     except Exception as e:
         text = f"Error while processing: {str(e)}"
