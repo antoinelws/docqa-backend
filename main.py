@@ -42,13 +42,11 @@ TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+from openai import OpenAI
+_openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
-    
-from openai import OpenAI
-
-# après load_dotenv() et OPENAI_API_KEY = os.getenv(...)
-_openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Models
 MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
