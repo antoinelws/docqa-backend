@@ -151,17 +151,61 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
     )
     return (resp.choices[0].message.content or "").strip()
 
+def is_general_shiperp_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+
+    patterns = [
+        "what is shiperp",
+        "what is ship erp",
+        "what is ship-erp",
+        "what does shiperp do",
+        "what does ship erp do",
+        "what does ship-erp do",
+        "what is the purpose of shiperp",
+        "what kind of software is shiperp",
+        "define shiperp",
+        "tell me about shiperp",
+        "give me an overview of shiperp",
+        "who is shiperp",
+        "what is this shiperp software",
+    ]
+
+    return any(p in q for p in patterns)
+
+
+def is_general_shiperp_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+
+    patterns = [
+        "what is shiperp",
+        "what is ship erp",
+        "what is ship-erp",
+        "what does shiperp do",
+        "what does ship erp do",
+        "what does ship-erp do",
+        "what is the purpose of shiperp",
+        "what kind of software is shiperp",
+        "define shiperp",
+        "tell me about shiperp",
+        "give me an overview of shiperp",
+        "who is shiperp",
+        "what is this shiperp software",
+    ]
+
+    return any(p in q for p in patterns)
+
+
 def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 700) -> str:
     """
-    Strong guard: if docs are provided, the assistant must NOT claim they are missing.
-    If it cannot answer, it should say 'I can't find it in the provided excerpts.' (no general knowledge).
+    Strict doc-only pass.
+    Used only when we have docs and the first answer incorrectly falls back to general knowledge.
     """
     system_rules = (
         "You are the ShipERP assistant.\n"
-        "You are given documentation excerpts. They are the ONLY allowed source.\n"
-        "Do NOT say the documentation is missing if any excerpts are provided.\n"
+        "You are given documentation excerpts. They are the primary source.\n"
+        "Do NOT say the documentation is missing if relevant excerpts are provided.\n"
         "Answer using ONLY the excerpts.\n"
-        "If you truly cannot answer from the excerpts, say exactly:\n"
+        "If the answer truly cannot be found in the excerpts, say exactly:\n"
         "\"I can't find this in the provided excerpts.\"\n"
         "Do not add general knowledge.\n"
         "Do not include a Sources section.\n"
@@ -813,11 +857,14 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
         user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
         os.makedirs(user_upload_folder, exist_ok=True)
 
-        # --- Index presence diagnostics (critical for consolidated RAG) ---
-        public_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index")) and \
-                               os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
-        internal_index_present = os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index")) and \
-                                 os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
+        public_index_present = (
+            os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index"))
+            and os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
+        )
+        internal_index_present = (
+            os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "faiss.index"))
+            and os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
+        )
 
         chunks, sources = retrieve_chunks_with_sources(
             question=question,
@@ -832,17 +879,31 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         has_docs = bool(chunks)
         docs_block = "\n\n".join(chunks) if chunks else "(none found for this question)"
+        general_shiperp_q = is_general_shiperp_question(question)
 
-        system_rules = (
-            "You are the ShipERP assistant.\n"
-            "Answer the question using ONLY the documentation excerpts below.\n\n"
-            "If the documentation excerpts contain relevant information, you MUST base your answer on them.\n"
-            "Do not say that the documentation is missing if relevant excerpts are provided.\n\n"
-            "If the documentation truly contains nothing relevant, say:\n"
-            '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
-            "Then give a concise answer.\n"
-            "Do not include a 'Sources' section."
-        )
+        if general_shiperp_q:
+            system_rules = (
+                "You are the ShipERP assistant.\n"
+                "The user is asking a broad, simple question about what ShipERP is or does.\n"
+                "Use the documentation excerpts if they help.\n"
+                "If they are incomplete, you may answer from general knowledge as well.\n"
+                "Prefer a simple, clear, high-level explanation suitable for a first-time user.\n"
+                "Do not invent highly specific implementation details unless supported by the documentation excerpts.\n"
+                "Do not include a 'Sources' section in your answer."
+            )
+        else:
+            system_rules = (
+                "You are the ShipERP assistant.\n"
+                "You must answer FIRST using the documentation excerpts provided below.\n"
+                "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+                "If the documentation does NOT contain the answer, say explicitly:\n"
+                "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+                "Only then, provide a concise general-knowledge answer.\n"
+                "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+                "Be practical and sufficiently detailed to be useful.\n"
+                "Do NOT include any 'Sources' section in your answer."
+            )
+
         messages = [
             {"role": "system", "content": system_rules},
             {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
@@ -851,33 +912,21 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
+        # If we have docs and this is NOT a general ShipERP overview question,
+        # do one strict doc-only retry when the first pass incorrectly falls back.
+        if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
+            strict_answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=700)
+            if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
+                answer = strict_answer
 
-        # --- Guard: if we HAVE docs but model still claims "docs missing", force strict second pass ---
-        if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
-            # Re-run with a prompt that forbids claiming docs are missing and forbids general knowledge
-            answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=700)
-            
-        if answer.lower().startswith(FALLBACK_MARKER):
+        # Final formatting
+        if (answer or "").lower().startswith(FALLBACK_MARKER):
             payload: Dict[str, Any] = {"answer": answer, "sources": []}
-            if debug:
-                payload.update(
-                    {
-                        "has_docs": has_docs,
-                        "model": MODEL_BIG,
-                        "tier": tier,
-                        "user_upload_folder": user_upload_folder,
-                        "public_index_present": public_index_present,
-                        "internal_index_present": internal_index_present,
-                        "chunks_count": len(chunks),
-                        "sources_preview": sources[:10],
-                    }
-                )
-            return payload
+        else:
+            out_sources = sources if has_docs else []
+            final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
+            payload = {"answer": final_answer, "sources": out_sources}
 
-        out_sources = sources if has_docs else []
-        final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
-
-        payload: Dict[str, Any] = {"answer": final_answer, "sources": out_sources}
         if debug:
             payload.update(
                 {
@@ -889,6 +938,8 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
                     "internal_index_present": internal_index_present,
                     "chunks_count": len(chunks),
                     "sources_preview": sources[:10],
+                    "docs_preview": chunks[:3],
+                    "general_shiperp_q": general_shiperp_q,
                 }
             )
 
@@ -995,7 +1046,7 @@ async def chat_api(
     user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
     os.makedirs(user_upload_folder, exist_ok=True)
 
-    # --- Index presence diagnostics (critical for consolidated RAG) ---
+    # --- Index presence diagnostics ---
     public_index_present = (
         os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index"))
         and os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
@@ -1057,10 +1108,10 @@ async def chat_api(
         summary = (state.get("summary") or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # --- RAG retrieval (public always; +internal if tier=internal) ---
+        # --- RAG retrieval ---
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=message,
-            tier=tier,  # internal => public+internal ; public => public only (handled inside retrieve)
+            tier=tier,
             user_upload_folder=user_upload_folder,
             k_public_internal=18,
             k_per_doc_upload=6,
@@ -1071,18 +1122,30 @@ async def chat_api(
 
         has_docs = bool(chunks)
         docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        general_shiperp_q = is_general_shiperp_question(message)
 
-        system_rules = (
-            "You are the ShipERP assistant.\n"
-            "You must answer FIRST using the documentation excerpts provided below.\n"
-            "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-            "If the documentation does NOT contain the answer, say explicitly:\n"
-            '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
-            "Only then, provide a general-knowledge answer.\n"
-            "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-            "Be practical and sufficiently detailed to be useful.\n"
-            "Do NOT include any 'Sources' section in your answer."
-        )
+        if general_shiperp_q:
+            system_rules = (
+                "You are the ShipERP assistant.\n"
+                "The user is asking a broad, simple question about what ShipERP is or does.\n"
+                "Use the documentation excerpts if they help.\n"
+                "If they are incomplete, you may answer from general knowledge as well.\n"
+                "Prefer a simple, clear, high-level explanation suitable for a first-time user.\n"
+                "Do not invent highly specific implementation details unless supported by the documentation excerpts.\n"
+                "Do not include a 'Sources' section in your answer."
+            )
+        else:
+            system_rules = (
+                "You are the ShipERP assistant.\n"
+                "You must answer FIRST using the documentation excerpts provided below.\n"
+                "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+                "If the documentation does NOT contain the answer, say explicitly:\n"
+                "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+                "Only then, provide a general-knowledge answer.\n"
+                "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+                "Be practical and sufficiently detailed to be useful.\n"
+                "Do NOT include any 'Sources' section in your answer."
+            )
 
         messages = [{"role": "system", "content": system_rules}]
         if summary:
@@ -1092,9 +1155,11 @@ async def chat_api(
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
-        # --- Guard: if we HAVE docs but model still outputs fallback marker, force strict doc-only pass ---
-        if has_docs and (answer or "").lower().startswith(FALLBACK_MARKER):
-            answer = answer_from_docs_strict(question=message, docs_block=docs_block, max_tokens=900)
+        # strict second pass only for normal doc-first questions
+        if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
+            strict_answer = answer_from_docs_strict(question=message, docs_block=docs_block, max_tokens=900)
+            if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
+                answer = strict_answer
 
         # --- Final formatting ---
         if (answer or "").lower().startswith(FALLBACK_MARKER):
@@ -1121,8 +1186,8 @@ async def chat_api(
                     "sources_preview": uniq_sources[:10],
                     "public_index_present": public_index_present,
                     "internal_index_present": internal_index_present,
-                    # super helpful to see what the model actually got:
                     "docs_preview": chunks[:3],
+                    "general_shiperp_q": general_shiperp_q,
                 }
             )
 
@@ -1130,7 +1195,6 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 # =========================
 # Admin pages
 # =========================
