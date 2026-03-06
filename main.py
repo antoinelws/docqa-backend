@@ -755,8 +755,8 @@ def retrieve_chunks_with_sources(
             if debug:
                 print("[RAG][DEBUG] keyword fallback error:", e)
 
-    # --- consolidated public/internal ---
-       try:
+        # --- consolidated public/internal ---
+    try:
         for qvec in qvecs:
             scored.extend(search_consolidated("public", qvec, k=k_public_internal))
             if tier == "internal":
