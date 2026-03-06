@@ -1105,7 +1105,32 @@ def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[di
 
     return cleaned
 
+def build_conversation_context_for_answer(messages: List[dict], max_user_turns: int = 4) -> str:
+    """
+    Build a compact conversational context for the final answer prompt.
+    Only includes recent USER questions, not assistant answers.
+    This avoids the model trying to answer old questions again.
+    """
+    user_msgs = [
+        (m.get("content") or "").strip()
+        for m in messages
+        if (m.get("role") == "user") and (m.get("content") or "").strip()
+    ]
 
+    if not user_msgs:
+        return ""
+
+    recent_user_msgs = user_msgs[-max_user_turns:]
+
+    lines = []
+    for i, msg in enumerate(recent_user_msgs[:-1], start=1):
+        lines.append(f"Previous user question {i}: {msg}")
+
+    if recent_user_msgs:
+        lines.append(f"Latest user question: {recent_user_msgs[-1]}")
+
+    return "\n".join(lines)
+    
 def _get_user_state(user_id: str) -> Dict[str, Any]:
     if user_id not in CHAT_STORE:
         CHAT_STORE[user_id] = {"summary": "", "messages": []}
@@ -1246,7 +1271,7 @@ async def chat_api(
 
         # --- Build prompt context ---
         summary = (state.get("summary") or "").strip()
-        recent = build_safe_chat_history(state["messages"], max_turns=6)
+        answer_context = build_conversation_context_for_answer(state["messages"], max_user_turns=4)
 
         # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
@@ -1294,7 +1319,7 @@ async def chat_api(
                 "Do NOT include any 'Sources' section in your answer."
             )
 
-        messages = [{"role": "system", "content": system_rules}]
+                messages = [{"role": "system", "content": system_rules}]
 
         if summary:
             messages.append({
@@ -1307,8 +1332,34 @@ async def chat_api(
                 )
             })
 
-        messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
-        messages.extend(recent)
+        if answer_context:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Conversation context for reference only. "
+                    "Use it only to resolve references in the latest question. "
+                    "Do NOT answer previous questions again.\n\n"
+                    f"{answer_context}"
+                )
+            })
+
+        messages.append({
+            "role": "system",
+            "content": (
+                "Answer ONLY the latest user question. "
+                "Do not repeat answers to earlier questions unless the latest question explicitly asks for that."
+            )
+        })
+
+        messages.append({
+            "role": "system",
+            "content": f"Documentation excerpts:\n{docs_block}"
+        })
+
+        messages.append({
+            "role": "user",
+            "content": message
+        })
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
