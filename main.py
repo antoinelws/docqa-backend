@@ -203,12 +203,14 @@ def rewrite_question_for_retrieval(
     recent_messages: Optional[List[dict]] = None,
 ) -> str:
     """
-    Rewrite the user's latest message into a standalone retrieval query.
+    Rewrite the user's latest message into a standalone, documentation-oriented retrieval query.
 
-    IMPORTANT:
-    - Use prior USER messages for context resolution.
-    - Do NOT rely on prior ASSISTANT answers as factual grounding.
-    - The goal is only to resolve ellipsis/reference, not to inherit earlier answers.
+    Goals:
+    - resolve follow-up references
+    - normalize abbreviations and vague wording
+    - prefer product/module wording likely to appear in documentation
+    - do NOT answer the question
+    - return only one rewritten query
     """
     current_question = (current_question or "").strip()
     if not current_question:
@@ -225,10 +227,19 @@ def rewrite_question_for_retrieval(
 
     prompt = (
         "Rewrite the user's last message into a standalone documentation search query.\n"
-        "Use previous USER questions only to resolve references like 'that', 'this', 'and on the EWM side?'.\n"
-        "Do NOT use prior assistant answers as factual context.\n"
-        "Do NOT answer the question.\n"
-        "Return only the rewritten query.\n\n"
+        "Requirements:\n"
+        "- Resolve follow-up references using only previous USER questions.\n"
+        "- Normalize abbreviations and vague terms into wording likely used in product documentation.\n"
+        "- Prefer explicit product/module names when possible.\n"
+        "- If the question mentions a module generically, rewrite it to the most likely documentation phrasing.\n"
+        "- Keep the exact same intent.\n"
+        "- Do NOT answer the question.\n"
+        "- Return only the rewritten query.\n\n"
+        "Examples:\n"
+        "- 'What is SO Module?' -> 'What is the ShipERP Sales Order Module?'\n"
+        "- 'What is Sales Order Module?' -> 'What is the ShipERP Sales Order Module?'\n"
+        "- 'How do I setup the SO Module?' -> 'How do I set up the ShipERP Sales Order Module?'\n"
+        "- 'and on the EWM side?' -> 'What are the determination tables for break bulk on the EWM side?'\n\n"
         f"Conversation summary:\n{summary or '(none)'}\n\n"
         f"Previous USER questions:\n" + ("\n".join(user_lines[:-1]) if len(user_lines) > 1 else "(none)") + "\n\n"
         f"Last USER question:\n{current_question}"
@@ -238,17 +249,16 @@ def rewrite_question_for_retrieval(
         rewritten = chat_completion(
             model=MODEL_MINI,
             messages=[
-                {"role": "system", "content": "You rewrite follow-up user questions into standalone retrieval queries."},
+                {"role": "system", "content": "You rewrite user questions into canonical documentation retrieval queries."},
                 {"role": "user", "content": prompt},
             ],
-            max_completion_tokens=120,
+            max_completion_tokens=140,
         ).strip()
 
         return rewritten or current_question
     except Exception as e:
         print("[RAG][rewrite_question_for_retrieval] failed:", e)
         return current_question
-
 
 def rerank_chunks_with_llm(
     question: str,
@@ -640,6 +650,55 @@ def _safe_email_folder(email: str) -> str:
 # =========================
 # Retrieval: consolidated (public/internal) + uploads per-doc
 # =========================
+
+def build_retrieval_queries(
+    original_question: str,
+    rewritten_question: str,
+) -> List[str]:
+    """
+    Build multiple retrieval queries for better recall:
+    - original user wording
+    - rewritten canonical wording
+    - short topic/module wording
+    """
+    queries: List[str] = []
+
+    original_question = (original_question or "").strip()
+    rewritten_question = (rewritten_question or "").strip()
+
+    if original_question:
+        queries.append(original_question)
+
+    if rewritten_question and rewritten_question.lower() != original_question.lower():
+        queries.append(rewritten_question)
+
+    short_query_prompt = (
+        "Turn this documentation search question into a short retrieval query.\n"
+        "Keep only the essential product/module/topic wording.\n"
+        "Do not answer.\n"
+        "Return only the short query.\n\n"
+        f"Question:\n{rewritten_question or original_question}"
+    )
+
+    try:
+        short_query = chat_completion(
+            model=MODEL_MINI,
+            messages=[
+                {"role": "system", "content": "You compress questions into short retrieval queries."},
+                {"role": "user", "content": short_query_prompt},
+            ],
+            max_completion_tokens=40,
+        ).strip()
+
+        if short_query:
+            lowered = {q.lower() for q in queries}
+            if short_query.lower() not in lowered:
+                queries.append(short_query)
+    except Exception as e:
+        print("[RAG][build_retrieval_queries] failed:", e)
+
+    return queries
+    
 def retrieve_chunks_with_sources(
     question: str,
     tier: str,
@@ -649,18 +708,24 @@ def retrieve_chunks_with_sources(
     max_total: int = 10,
     chunk_max_chars: int = 1200,
     debug: bool = False,
+    extra_queries: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str]]:
 
-    question = (question or "").strip()
-    if not question:
+    base_question = (question or "").strip()
+    if not base_question:
         return [], []
 
-    qvecs = embed_texts([question])
+    query_texts = [base_question]
+    for q in (extra_queries or []):
+        q = (q or "").strip()
+        if q and q.lower() not in {x.lower() for x in query_texts}:
+            query_texts.append(q)
+
+    qvecs = embed_texts(query_texts)
     if not qvecs:
         return [], []
-    qvec = qvecs[0]
 
-    scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
+    scored: List[Tuple[float, str, str]] = []
 
     # --- Optional keyword anti-regression for ShipERP variants ---
     q_lc = question.lower()
@@ -691,10 +756,11 @@ def retrieve_chunks_with_sources(
                 print("[RAG][DEBUG] keyword fallback error:", e)
 
     # --- consolidated public/internal ---
-    try:
-        scored.extend(search_consolidated("public", qvec, k=k_public_internal))
-        if tier == "internal":
-            scored.extend(search_consolidated("internal", qvec, k=k_public_internal))
+       try:
+        for qvec in qvecs:
+            scored.extend(search_consolidated("public", qvec, k=k_public_internal))
+            if tier == "internal":
+                scored.extend(search_consolidated("internal", qvec, k=k_public_internal))
     except Exception as e:
         if debug:
             print("[RAG][DEBUG] consolidated search error:", e)
@@ -713,17 +779,18 @@ def retrieve_chunks_with_sources(
                 chunks_list = json.load(f)
 
             idx = faiss.read_index(index_path)
-            with _FAISS_LOCK:
-                D, I = idx.search(np.array([qvec]).astype("float32"), k=k_per_doc_upload)
+            for qvec in qvecs:
+                with _FAISS_LOCK:
+                    D, I = idx.search(np.array([qvec]).astype("float32"), k=k_per_doc_upload)
 
-            for dist, ci in zip(D[0], I[0]):
-                if 0 <= ci < len(chunks_list):
-                    c = (chunks_list[ci] or "").strip()
-                    if c:
-                        scored.append((float(dist), c, f"upload:{base}"))
+                for dist, ci in zip(D[0], I[0]):
+                    if 0 <= ci < len(chunks_list):
+                        c = (chunks_list[ci] or "").strip()
+                        if c:
+                            scored.append((float(dist), c, f"upload:{base}"))
     except Exception as e:
         if debug:
-            print("[RAG][DEBUG] upload search error:", e)
+            print("[RAG][DEBUG] query_texts:", query_texts)
 
     if not scored:
         return [], []
@@ -1044,6 +1111,7 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
                     "docs_preview": chunks[:3],
                     "general_shiperp_q": general_shiperp_q,
                     "retrieval_query": retrieval_query,
+                    "retrieval_queries": retrieval_queries,
                 }
             )
 
@@ -1277,18 +1345,23 @@ async def chat_api(
             recent_messages=state.get("messages", []),
         )
 
-        # --- RAG retrieval ---
+        retrieval_queries = build_retrieval_queries(
+            original_question=message,
+            rewritten_question=retrieval_query,
+        )
+
         chunks, uniq_sources = retrieve_chunks_with_sources(
             question=retrieval_query,
+            extra_queries=retrieval_queries,
             tier=tier,
             user_upload_folder=user_upload_folder,
-            k_public_internal=24,
-            k_per_doc_upload=8,
+            k_public_internal=32,
+            k_per_doc_upload=10,
             max_total=10,
             chunk_max_chars=1200,
             debug=debug,
         )
-
+        
         has_docs = bool(chunks)
         docs_block = "\n\n".join(chunks) if chunks else "(none found for this question)"
         general_shiperp_q = is_general_shiperp_question(message)
