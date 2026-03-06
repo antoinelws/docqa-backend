@@ -218,6 +218,51 @@ def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 70
     ]
     return chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=max_tokens)
 
+def rewrite_question_for_retrieval(
+    current_question: str,
+    summary: str = "",
+    recent_messages: Optional[List[dict]] = None,
+) -> str:
+    current_question = (current_question or "").strip()
+    if not current_question:
+        return ""
+
+    recent_messages = recent_messages or []
+
+    convo_lines: List[str] = []
+    for m in recent_messages[-8:]:
+        role = (m.get("role") or "").strip()
+        content = (m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            convo_lines.append(f"{role}: {content}")
+
+    prompt = (
+        "Rewrite the user's last question as a standalone search query for documentation retrieval.\n"
+        "Preserve the original intent.\n"
+        "Resolve references to prior context when needed.\n"
+        "Be specific.\n"
+        "Do not answer the question.\n"
+        "Return only the rewritten standalone question.\n\n"
+        f"Conversation summary:\n{summary or '(none)'}\n\n"
+        f"Recent conversation:\n" + ("\n".join(convo_lines) if convo_lines else "(none)") + "\n\n"
+        f"User's last question:\n{current_question}"
+    )
+
+    try:
+        rewritten = chat_completion(
+            model=MODEL_MINI,
+            messages=[
+                {"role": "system", "content": "You rewrite follow-up questions into standalone retrieval queries."},
+                {"role": "user", "content": prompt},
+            ],
+            max_completion_tokens=120,
+        ).strip()
+
+        return rewritten or current_question
+    except Exception as e:
+        print("[RAG][rewrite_question_for_retrieval] failed:", e)
+        return current_question
+
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     clean_texts: List[str] = []
     for t in texts:
@@ -1108,9 +1153,16 @@ async def chat_api(
         summary = (state.get("summary") or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
+        # --- Rewrite follow-up question into standalone retrieval query ---
+        retrieval_query = rewrite_question_for_retrieval(
+            current_question=message,
+            summary=summary,
+            recent_messages=state.get("messages", []),
+        )
+
         # --- RAG retrieval ---
         chunks, uniq_sources = retrieve_chunks_with_sources(
-            question=message,
+            question=retrieval_query,
             tier=tier,
             user_upload_folder=user_upload_folder,
             k_public_internal=18,
@@ -1188,6 +1240,7 @@ async def chat_api(
                     "internal_index_present": internal_index_present,
                     "docs_preview": chunks[:3],
                     "general_shiperp_q": general_shiperp_q,
+                    "retrieval_query": retrieval_query,
                 }
             )
 
