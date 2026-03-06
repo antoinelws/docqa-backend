@@ -1319,7 +1319,7 @@ async def chat_api(
                 "Do NOT include any 'Sources' section in your answer."
             )
 
-                messages = [{"role": "system", "content": system_rules}]
+        messages = [{"role": "system", "content": system_rules}]
 
         if summary:
             messages.append({
