@@ -216,7 +216,6 @@ def rewrite_question_for_retrieval(
 
     recent_messages = recent_messages or []
 
-    # Only keep prior USER turns as reliable conversational context
     user_lines: List[str] = []
     for m in recent_messages[-10:]:
         role = (m.get("role") or "").strip()
@@ -1261,8 +1260,7 @@ async def chat_api(
                 user_msgs = user_msgs[:-1]
 
             if user_msgs:
-                first_q = user_msgs[0]
-                answer = f'Your first question in this chat was: "{first_q}"'
+                answer = f'Your first question in this chat was: "{user_msgs[0]}"'
             else:
                 answer = "I don't have any earlier question stored in this chat yet."
 
@@ -1271,7 +1269,6 @@ async def chat_api(
 
         # --- Build prompt context ---
         summary = (state.get("summary") or "").strip()
-        answer_context = build_conversation_context_for_answer(state["messages"], max_user_turns=4)
 
         # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
@@ -1309,16 +1306,22 @@ async def chat_api(
         else:
             system_rules = (
                 "You are the ShipERP assistant.\n"
-                "You must answer FIRST using the documentation excerpts provided below.\n"
+                "Answer ONLY the latest user question.\n"
+                "Use the documentation excerpts below first.\n"
                 "If the documentation contains relevant information, base your answer strictly on it.\n\n"
                 "If the documentation does NOT contain the answer, say explicitly:\n"
                 "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
                 "Only then, provide a general-knowledge answer.\n"
+                "Do not answer previous questions again unless the latest question explicitly asks for that.\n"
                 "Do not mix documentation-based information and general knowledge in the same sentence.\n"
                 "Be practical and sufficiently detailed to be useful.\n"
                 "Do NOT include any 'Sources' section in your answer."
             )
 
+        # IMPORTANT:
+        # - no messages.extend(recent)
+        # - we pass only the latest user question as the final user turn
+        # - conversation memory stays as system context, not active turns to re-answer
         messages = [{"role": "system", "content": system_rules}]
 
         if summary:
@@ -1332,22 +1335,12 @@ async def chat_api(
                 )
             })
 
-        if answer_context:
-            messages.append({
-                "role": "system",
-                "content": (
-                    "Conversation context for reference only. "
-                    "Use it only to resolve references in the latest question. "
-                    "Do NOT answer previous questions again.\n\n"
-                    f"{answer_context}"
-                )
-            })
-
         messages.append({
             "role": "system",
             "content": (
-                "Answer ONLY the latest user question. "
-                "Do not repeat answers to earlier questions unless the latest question explicitly asks for that."
+                "The following rewritten retrieval query was used only to search the docs. "
+                "It may help resolve references, but you must answer ONLY the latest user question.\n\n"
+                f"Retrieval query: {retrieval_query}"
             )
         })
 
@@ -1378,12 +1371,9 @@ async def chat_api(
             final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
 
         assistant_to_store = final_answer
-
-        # If the answer is fallback general knowledge, store a shorter neutral trace
-        # instead of the full generated answer, to reduce future contamination.
         if (final_answer or "").lower().startswith(FALLBACK_MARKER):
             assistant_to_store = "[Assistant gave a general-knowledge fallback answer.]"
-        
+
         state["messages"].append({"role": "assistant", "content": assistant_to_store, "ts": _now_iso()})
 
         # keep memory bounded
@@ -1411,6 +1401,7 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+        
 # =========================
 # Admin pages
 # =========================
