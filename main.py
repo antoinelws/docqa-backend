@@ -1062,8 +1062,10 @@ CHAT_CONTEXT_CHAR_BUDGET = 14000
 
 CHAT_STORE: Dict[str, Dict[str, Any]] = {}  # in-memory, resets on restart
 
+
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
 
 def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[dict]:
     out = []
@@ -1078,6 +1080,7 @@ def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[di
         out.append({"role": m["role"], "content": c})
         total += size
     return list(reversed(out))
+
 
 def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[dict]:
     """
@@ -1102,15 +1105,12 @@ def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[di
 
     return cleaned
 
-def _get_user_state(user_id: str) -> Dict[str, Any]:
-    if user_id not in CHAT_STORE:
-        CHAT_STORE[user_id] = {"summary": "", "messages": []}
-    return CHAT_STORE[user_id]
 
 def _get_user_state(user_id: str) -> Dict[str, Any]:
     if user_id not in CHAT_STORE:
         CHAT_STORE[user_id] = {"summary": "", "messages": []}
     return CHAT_STORE[user_id]
+
 
 def _summarize_if_needed(user_id: str):
     state = _get_user_state(user_id)
@@ -1121,29 +1121,31 @@ def _summarize_if_needed(user_id: str):
 
     keep = msgs[-CHAT_MAX_TURNS:]
     old = msgs[:-CHAT_MAX_TURNS]
-    old_text = "\n".join([f"{m['role']}: {m['content']}" for m in old if m.get("content")])
+    old_text = "\n".join(
+        [f"{m['role']}: {m['content']}" for m in old if m.get("content")]
+    )
 
     if not old_text.strip():
         state["messages"] = keep
         return
 
-        summary_prompt = f"""You are maintaining a running summary of a chat.
+    summary_prompt = f"""You are maintaining a running summary of a chat.
 
-        Current summary (may be empty):
-        {state['summary']}
-        
-        New dialogue to summarize:
-        {old_text}
-        
-        Update the summary.
-        
-        Rules:
-        - Preserve user goals, constraints, topics, product/module names, and open questions.
-        - Prefer USER requests and documented conclusions.
-        - Do NOT treat assistant answers as factual truth unless they were clearly grounded in documentation.
-        - If uncertain, summarize assistant content as tentative rather than authoritative.
-        - Keep it concise and operational.
-        """
+Current summary (may be empty):
+{state['summary']}
+
+New dialogue to summarize:
+{old_text}
+
+Update the summary.
+
+Rules:
+- Preserve user goals, constraints, topics, product/module names, and open questions.
+- Prefer USER requests and documented conclusions.
+- Do NOT treat assistant answers as factual truth unless they were clearly grounded in documentation.
+- If uncertain, summarize assistant content as tentative rather than authoritative.
+- Keep it concise and operational.
+"""
 
     try:
         new_summary = chat_completion(
@@ -1292,17 +1294,19 @@ async def chat_api(
                 "Do NOT include any 'Sources' section in your answer."
             )
 
-        messages = [{"role": "system", "content": system_rules}]
-       if summary:
-        messages.append({
-            "role": "system",
-            "content": (
-                "Conversation memory for continuity only. "
-                "Do not treat it as factual source material. "
-                "Documentation excerpts below always take priority.\n\n"
-                f"{summary}"
-            )
-        })
+                messages = [{"role": "system", "content": system_rules}]
+
+        if summary:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Conversation memory for continuity only. "
+                    "Do not treat it as factual source material. "
+                    "Documentation excerpts below always take priority.\n\n"
+                    f"{summary}"
+                )
+            })
+
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
