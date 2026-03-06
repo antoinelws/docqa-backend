@@ -173,28 +173,6 @@ def is_general_shiperp_question(question: str) -> bool:
     return any(p in q for p in patterns)
 
 
-def is_general_shiperp_question(question: str) -> bool:
-    q = (question or "").strip().lower()
-
-    patterns = [
-        "what is shiperp",
-        "what is ship erp",
-        "what is ship-erp",
-        "what does shiperp do",
-        "what does ship erp do",
-        "what does ship-erp do",
-        "what is the purpose of shiperp",
-        "what kind of software is shiperp",
-        "define shiperp",
-        "tell me about shiperp",
-        "give me an overview of shiperp",
-        "who is shiperp",
-        "what is this shiperp software",
-    ]
-
-    return any(p in q for p in patterns)
-
-
 def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 700) -> str:
     """
     Strict doc-only pass.
@@ -218,11 +196,19 @@ def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 70
     ]
     return chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=max_tokens)
 
+
 def rewrite_question_for_retrieval(
     current_question: str,
     summary: str = "",
     recent_messages: Optional[List[dict]] = None,
 ) -> str:
+    """
+    Rewrite the user's latest question into a standalone retrieval query.
+    Useful for follow-ups like:
+    - 'and on the EWM side?'
+    - 'what about this module?'
+    - 'what are the tables for that?'
+    """
     current_question = (current_question or "").strip()
     if not current_question:
         return ""
@@ -237,15 +223,15 @@ def rewrite_question_for_retrieval(
             convo_lines.append(f"{role}: {content}")
 
     prompt = (
-        "Rewrite the user's last question as a standalone search query for documentation retrieval.\n"
-        "Preserve the original intent.\n"
-        "Resolve references to prior context when needed.\n"
-        "Be specific.\n"
+        "Rewrite the user's last message into a standalone documentation search query.\n"
+        "Use the recent conversation only to resolve references and ellipsis.\n"
+        "Keep the same intent.\n"
+        "Make the query explicit and specific enough for document retrieval.\n"
         "Do not answer the question.\n"
-        "Return only the rewritten standalone question.\n\n"
+        "Return only the rewritten query.\n\n"
         f"Conversation summary:\n{summary or '(none)'}\n\n"
         f"Recent conversation:\n" + ("\n".join(convo_lines) if convo_lines else "(none)") + "\n\n"
-        f"User's last question:\n{current_question}"
+        f"Last user message:\n{current_question}"
     )
 
     try:
@@ -262,6 +248,64 @@ def rewrite_question_for_retrieval(
     except Exception as e:
         print("[RAG][rewrite_question_for_retrieval] failed:", e)
         return current_question
+
+
+def rerank_chunks_with_llm(
+    question: str,
+    chunks_with_sources: List[Tuple[str, str]],
+    max_keep: int = 8,
+) -> List[Tuple[str, str]]:
+    """
+    Rerank candidate chunks with an LLM for precision after vector retrieval.
+    Input: [(chunk, source), ...]
+    Output: top reranked [(chunk, source), ...]
+    """
+    if not chunks_with_sources:
+        return []
+
+    numbered_blocks = []
+    for i, (chunk, source) in enumerate(chunks_with_sources, start=1):
+        numbered_blocks.append(f"[{i}] SOURCE: {source}\n{chunk}")
+
+    prompt = (
+        "You are ranking documentation excerpts for relevance.\n"
+        "Given a user question and candidate excerpts, select the excerpt numbers that are most helpful for answering the question.\n"
+        "Prefer precise, directly relevant excerpts.\n"
+        f"Return only a comma-separated list of numbers, up to {max_keep} items.\n\n"
+        f"Question:\n{question}\n\n"
+        "Candidate excerpts:\n\n" + "\n\n---\n\n".join(numbered_blocks)
+    )
+
+    try:
+        raw = chat_completion(
+            model=MODEL_MINI,
+            messages=[
+                {"role": "system", "content": "You select the most relevant documentation excerpts."},
+                {"role": "user", "content": prompt},
+            ],
+            max_completion_tokens=80,
+        )
+
+        picked: List[int] = []
+        for part in raw.replace("\n", ",").split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(chunks_with_sources):
+                    picked.append(idx)
+
+        seen = set()
+        ordered: List[Tuple[str, str]] = []
+        for idx in picked:
+            if idx not in seen:
+                seen.add(idx)
+                ordered.append(chunks_with_sources[idx - 1])
+
+        return ordered[:max_keep] if ordered else chunks_with_sources[:max_keep]
+
+    except Exception as e:
+        print("[RAG][rerank_chunks_with_llm] failed:", e)
+        return chunks_with_sources[:max_keep]
 
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     clean_texts: List[str] = []
@@ -600,9 +644,9 @@ def retrieve_chunks_with_sources(
     question: str,
     tier: str,
     user_upload_folder: str,
-    k_public_internal: int = 18,
-    k_per_doc_upload: int = 6,
-    max_total: int = 12,
+    k_public_internal: int = 24,
+    k_per_doc_upload: int = 8,
+    max_total: int = 10,
     chunk_max_chars: int = 1200,
     debug: bool = False,
 ) -> Tuple[List[str], List[str]]:
@@ -618,7 +662,7 @@ def retrieve_chunks_with_sources(
 
     scored: List[Tuple[float, str, str]] = []  # (dist, chunk, source)
 
-    # --- Keyword anti-regression (ShipERP variants) ---
+    # --- Optional keyword anti-regression for ShipERP variants ---
     q_lc = question.lower()
     needles: List[str] = []
     if ("shiperp" in q_lc) or ("ship erp" in q_lc) or ("ship-erp" in q_lc):
@@ -646,7 +690,7 @@ def retrieve_chunks_with_sources(
             if debug:
                 print("[RAG][DEBUG] keyword fallback error:", e)
 
-    # 1) consolidated public/internal
+    # --- consolidated public/internal ---
     try:
         scored.extend(search_consolidated("public", qvec, k=k_public_internal))
         if tier == "internal":
@@ -655,7 +699,7 @@ def retrieve_chunks_with_sources(
         if debug:
             print("[RAG][DEBUG] consolidated search error:", e)
 
-    # 2) user uploads (per-doc)
+    # --- user uploads (per-doc) ---
     try:
         folder = user_upload_folder
         json_paths = glob.glob(f"{folder}/*.json")
@@ -686,33 +730,48 @@ def retrieve_chunks_with_sources(
 
     scored.sort(key=lambda x: x[0])
 
-    chunks: List[str] = []
-    sources: List[str] = []
+    # Keep more candidates than final output, then rerank
+    candidates: List[Tuple[str, str]] = []
     seen_chunks = set()
-    seen_src = set()
 
-    for dist, c, src in scored:
-        if not c or c in seen_chunks:
+    for _, chunk, src in scored:
+        if not chunk or chunk in seen_chunks:
             continue
-        seen_chunks.add(c)
+        seen_chunks.add(chunk)
 
-        if len(c) > chunk_max_chars:
-            c = c[:chunk_max_chars].rstrip() + "…"
+        if len(chunk) > chunk_max_chars:
+            chunk = chunk[:chunk_max_chars].rstrip() + "…"
 
-        chunks.append(c)
+        candidates.append((chunk, src))
 
-        if src and src not in seen_src:
-            seen_src.add(src)
-            sources.append(src)
-
-        if len(chunks) >= max_total:
+        if len(candidates) >= 24:
             break
 
+    if not candidates:
+        return [], []
+
+    reranked = rerank_chunks_with_llm(
+        question=question,
+        chunks_with_sources=candidates,
+        max_keep=max_total,
+    )
+
+    final_chunks: List[str] = []
+    final_sources: List[str] = []
+    seen_src = set()
+
+    for chunk, src in reranked:
+        final_chunks.append(chunk)
+        if src and src not in seen_src:
+            seen_src.add(src)
+            final_sources.append(src)
+
     if debug:
-        print("[RAG][DEBUG] tier:", tier, "chunks:", len(chunks), "sources:", sources)
+        print("[RAG][DEBUG] final retrieval query:", question)
+        print("[RAG][DEBUG] final chunks:", len(final_chunks))
+        print("[RAG][DEBUG] final sources:", final_sources)
 
-    return chunks, sources
-
+    return final_chunks, final_sources
 
 # =========================
 # FastAPI app
@@ -911,13 +970,15 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
             and os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
         )
 
+        retrieval_query = question
+
         chunks, sources = retrieve_chunks_with_sources(
-            question=question,
+            question=retrieval_query,
             tier=tier,
             user_upload_folder=user_upload_folder,
-            k_public_internal=18,
-            k_per_doc_upload=6,
-            max_total=12,
+            k_public_internal=24,
+            k_per_doc_upload=8,
+            max_total=10,
             chunk_max_chars=1200,
             debug=debug,
         )
@@ -957,14 +1018,11 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
-        # If we have docs and this is NOT a general ShipERP overview question,
-        # do one strict doc-only retry when the first pass incorrectly falls back.
         if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
             strict_answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=700)
             if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
                 answer = strict_answer
 
-        # Final formatting
         if (answer or "").lower().startswith(FALLBACK_MARKER):
             payload: Dict[str, Any] = {"answer": answer, "sources": []}
         else:
@@ -985,6 +1043,7 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
                     "sources_preview": sources[:10],
                     "docs_preview": chunks[:3],
                     "general_shiperp_q": general_shiperp_q,
+                    "retrieval_query": retrieval_query,
                 }
             )
 
@@ -992,8 +1051,6 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
 # =========================
 # Conversation (per-user) + RAG
 # =========================
@@ -1153,7 +1210,7 @@ async def chat_api(
         summary = (state.get("summary") or "").strip()
         recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
 
-        # --- Rewrite follow-up question into standalone retrieval query ---
+        # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
             current_question=message,
             summary=summary,
@@ -1165,15 +1222,15 @@ async def chat_api(
             question=retrieval_query,
             tier=tier,
             user_upload_folder=user_upload_folder,
-            k_public_internal=18,
-            k_per_doc_upload=6,
-            max_total=12,
+            k_public_internal=24,
+            k_per_doc_upload=8,
+            max_total=10,
             chunk_max_chars=1200,
             debug=debug,
         )
 
         has_docs = bool(chunks)
-        docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+        docs_block = "\n\n".join(chunks) if chunks else "(none found for this question)"
         general_shiperp_q = is_general_shiperp_question(message)
 
         if general_shiperp_q:
