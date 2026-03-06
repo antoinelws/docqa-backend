@@ -203,11 +203,12 @@ def rewrite_question_for_retrieval(
     recent_messages: Optional[List[dict]] = None,
 ) -> str:
     """
-    Rewrite the user's latest question into a standalone retrieval query.
-    Useful for follow-ups like:
-    - 'and on the EWM side?'
-    - 'what about this module?'
-    - 'what are the tables for that?'
+    Rewrite the user's latest message into a standalone retrieval query.
+
+    IMPORTANT:
+    - Use prior USER messages for context resolution.
+    - Do NOT rely on prior ASSISTANT answers as factual grounding.
+    - The goal is only to resolve ellipsis/reference, not to inherit earlier answers.
     """
     current_question = (current_question or "").strip()
     if not current_question:
@@ -215,30 +216,30 @@ def rewrite_question_for_retrieval(
 
     recent_messages = recent_messages or []
 
-    convo_lines: List[str] = []
-    for m in recent_messages[-8:]:
+    # Only keep prior USER turns as reliable conversational context
+    user_lines: List[str] = []
+    for m in recent_messages[-10:]:
         role = (m.get("role") or "").strip()
         content = (m.get("content") or "").strip()
-        if role in ("user", "assistant") and content:
-            convo_lines.append(f"{role}: {content}")
+        if role == "user" and content:
+            user_lines.append(content)
 
     prompt = (
         "Rewrite the user's last message into a standalone documentation search query.\n"
-        "Use the recent conversation only to resolve references and ellipsis.\n"
-        "Keep the same intent.\n"
-        "Make the query explicit and specific enough for document retrieval.\n"
-        "Do not answer the question.\n"
+        "Use previous USER questions only to resolve references like 'that', 'this', 'and on the EWM side?'.\n"
+        "Do NOT use prior assistant answers as factual context.\n"
+        "Do NOT answer the question.\n"
         "Return only the rewritten query.\n\n"
         f"Conversation summary:\n{summary or '(none)'}\n\n"
-        f"Recent conversation:\n" + ("\n".join(convo_lines) if convo_lines else "(none)") + "\n\n"
-        f"Last user message:\n{current_question}"
+        f"Previous USER questions:\n" + ("\n".join(user_lines[:-1]) if len(user_lines) > 1 else "(none)") + "\n\n"
+        f"Last USER question:\n{current_question}"
     )
 
     try:
         rewritten = chat_completion(
             model=MODEL_MINI,
             messages=[
-                {"role": "system", "content": "You rewrite follow-up questions into standalone retrieval queries."},
+                {"role": "system", "content": "You rewrite follow-up user questions into standalone retrieval queries."},
                 {"role": "user", "content": prompt},
             ],
             max_completion_tokens=120,
@@ -1078,6 +1079,34 @@ def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[di
         total += size
     return list(reversed(out))
 
+def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[dict]:
+    """
+    Keep recent USER messages and only short ASSISTANT messages.
+    Avoid feeding long assistant answers back into the model because they may contain errors.
+    """
+    cleaned: List[dict] = []
+
+    tail = messages[-max_turns * 2:]
+
+    for m in tail:
+        role = (m.get("role") or "").strip()
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+
+        if role == "user":
+            cleaned.append({"role": "user", "content": content})
+        elif role == "assistant":
+            if len(content) <= 300:
+                cleaned.append({"role": "assistant", "content": content})
+
+    return cleaned
+
+def _get_user_state(user_id: str) -> Dict[str, Any]:
+    if user_id not in CHAT_STORE:
+        CHAT_STORE[user_id] = {"summary": "", "messages": []}
+    return CHAT_STORE[user_id]
+
 def _get_user_state(user_id: str) -> Dict[str, Any]:
     if user_id not in CHAT_STORE:
         CHAT_STORE[user_id] = {"summary": "", "messages": []}
@@ -1098,16 +1127,23 @@ def _summarize_if_needed(user_id: str):
         state["messages"] = keep
         return
 
-    summary_prompt = f"""You are maintaining a running summary of a chat.
+        summary_prompt = f"""You are maintaining a running summary of a chat.
 
-Current summary (may be empty):
-{state['summary']}
-
-New dialogue to summarize:
-{old_text}
-
-Update the summary. Keep it factual and concise. Preserve decisions, constraints, names, and open questions.
-"""
+        Current summary (may be empty):
+        {state['summary']}
+        
+        New dialogue to summarize:
+        {old_text}
+        
+        Update the summary.
+        
+        Rules:
+        - Preserve user goals, constraints, topics, product/module names, and open questions.
+        - Prefer USER requests and documented conclusions.
+        - Do NOT treat assistant answers as factual truth unless they were clearly grounded in documentation.
+        - If uncertain, summarize assistant content as tentative rather than authoritative.
+        - Keep it concise and operational.
+        """
 
     try:
         new_summary = chat_completion(
@@ -1208,7 +1244,7 @@ async def chat_api(
 
         # --- Build prompt context ---
         summary = (state.get("summary") or "").strip()
-        recent = _trim_messages_to_budget(state["messages"], budget_chars=CHAT_CONTEXT_CHAR_BUDGET)
+        recent = build_safe_chat_history(state["messages"], max_turns=6)
 
         # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
@@ -1257,8 +1293,16 @@ async def chat_api(
             )
 
         messages = [{"role": "system", "content": system_rules}]
-        if summary:
-            messages.append({"role": "system", "content": f"Conversation memory (summary):\n{summary}"})
+       if summary:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Conversation memory for continuity only. "
+                "Do not treat it as factual source material. "
+                "Documentation excerpts below always take priority.\n\n"
+                f"{summary}"
+            )
+        })
         messages.append({"role": "system", "content": f"Documentation excerpts:\n{docs_block}"})
         messages.extend(recent)
 
@@ -1278,7 +1322,14 @@ async def chat_api(
             out_sources = uniq_sources if has_docs else []
             final_answer = answer.rstrip() + (("\n\nSources: " + ", ".join(out_sources)) if out_sources else "")
 
-        state["messages"].append({"role": "assistant", "content": final_answer, "ts": _now_iso()})
+        assistant_to_store = final_answer
+
+        # If the answer is fallback general knowledge, store a shorter neutral trace
+        # instead of the full generated answer, to reduce future contamination.
+        if (final_answer or "").lower().startswith(FALLBACK_MARKER):
+            assistant_to_store = "[Assistant gave a general-knowledge fallback answer.]"
+        
+        state["messages"].append({"role": "assistant", "content": assistant_to_store, "ts": _now_iso()})
 
         # keep memory bounded
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
