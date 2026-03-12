@@ -194,7 +194,7 @@ def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 70
         {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
         {"role": "user", "content": question},
     ]
-    return chat_completion(=_BIG, messages=messages, max_completion_tokens=max_tokens)
+    return chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=max_tokens)
 
 
 def rewrite_question_for_retrieval(
