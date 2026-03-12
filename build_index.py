@@ -185,7 +185,13 @@ def build_index(docs_path: str, out_path: str):
 
             for i in range(0, len(chunks), BATCH_SIZE):
                 batch_chunks = chunks[i:i + BATCH_SIZE]
-                embs = embed_batch(batch_chunks)
+            
+                batch_embed_inputs = [
+                    f"Source document: {f.name}\n\nContent:\n{chunk}"
+                    for chunk in batch_chunks
+                ]
+            
+                embs = embed_batch(batch_embed_inputs)
 
                 if not embs:
                     print(f"[WARN] embeddings failed for batch in {f} (skipping batch)", flush=True)
