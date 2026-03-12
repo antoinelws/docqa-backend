@@ -1091,8 +1091,19 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
         if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
-            strict_answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=700)
-            if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
+            strict_answer = answer_from_docs_strict(
+                question=message,
+                docs_block=docs_block,
+                max_tokens=900
+            )
+
+            # Only keep the strict answer if it found something useful in the excerpts.
+            # Otherwise keep the original fallback-to-general-knowledge answer.
+            if (
+                strict_answer
+                and strict_answer.strip()
+                and strict_answer.strip() != "I can't find this in the provided excerpts."
+            ):
                 answer = strict_answer
 
         if (answer or "").lower().startswith(FALLBACK_MARKER):
@@ -1385,15 +1396,14 @@ async def chat_api(
             system_rules = (
                 "You are the ShipERP assistant.\n"
                 "Answer ONLY the latest user question.\n"
-                "Use the documentation excerpts below first.\n"
-                "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-                "If the documentation does NOT contain the answer, say explicitly:\n"
-                "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-                "Only then, provide a general-knowledge answer.\n"
-                "Do not answer previous questions again unless the latest question explicitly asks for that.\n"
-                "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-                "Be practical and sufficiently detailed to be useful.\n"
-                "Do NOT include any 'Sources' section in your answer."
+                "Use the documentation excerpts below as the primary source.\n"
+                "If the excerpts contain relevant information, answer from them directly and do NOT say the documentation is missing.\n"
+                "If the excerpts partially answer the question, give the best documentation-based answer first.\n"
+                "Only if the excerpts truly do not answer the question, say exactly:\n"
+                "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n"
+                "Then provide a general-knowledge answer.\n"
+                "Do not answer previous questions again.\n"
+                "Do not include a 'Sources' section in the answer body."
             )
 
         # IMPORTANT:
