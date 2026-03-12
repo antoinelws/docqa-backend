@@ -939,7 +939,12 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         if not chunks:
             return JSONResponse({"error": "No text extracted from uploaded file."}, status_code=400)
 
-        vectors = embed_texts(chunks)
+        embed_inputs = [
+            f"Source document: {filename}\n\nContent:\n{chunk}"
+            for chunk in chunks
+        ]
+
+        vectors = embed_texts(embed_inputs)
         if not vectors:
             return JSONResponse({"error": "No valid text to embed in this document."}, status_code=400)
 
