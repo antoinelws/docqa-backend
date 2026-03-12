@@ -49,8 +49,8 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 # Models
-MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-5-mini")
-MODEL_BIG = os.getenv("OPENAI_MODEL_BIG", "gpt-5.2")
+MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-4o-mini")
+MODEL_BIG  = os.getenv("OPENAI_MODEL_BIG", "gpt-4o")
 
 # SharePoint
 DRIVE_ID = os.getenv(
@@ -194,7 +194,7 @@ def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 70
         {"role": "system", "content": f"Documentation excerpts:\n{docs_block}"},
         {"role": "user", "content": question},
     ]
-    return chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=max_tokens)
+    return chat_completion(=_BIG, messages=messages, max_completion_tokens=max_tokens)
 
 
 def rewrite_question_for_retrieval(
