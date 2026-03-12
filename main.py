@@ -1096,13 +1096,14 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
                 docs_block=docs_block,
                 max_tokens=900
             )
-
-            # Only keep the strict answer if it found something useful in the excerpts.
-            # Otherwise keep the original fallback-to-general-knowledge answer.
+        
+            # Only replace the original answer if the strict pass found a real doc-based answer.
+            # Otherwise keep the original fallback-to-general-knowledge response.
             if (
                 strict_answer
                 and strict_answer.strip()
                 and strict_answer.strip() != "I can't find this in the provided excerpts."
+                and not strict_answer.strip().lower().startswith("i can't find this in the provided excerpts")
             ):
                 answer = strict_answer
 
@@ -1398,7 +1399,7 @@ async def chat_api(
                 "Answer ONLY the latest user question.\n"
                 "Use the documentation excerpts below as the primary source.\n"
                 "If the excerpts contain relevant information, answer from them directly and do NOT say the documentation is missing.\n"
-                "If the excerpts partially answer the question, give the best documentation-based answer first.\n"
+                "If the excerpts partially answer the question, provide the best documentation-based answer you can.\n"
                 "Only if the excerpts truly do not answer the question, say exactly:\n"
                 "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n"
                 "Then provide a general-knowledge answer.\n"
