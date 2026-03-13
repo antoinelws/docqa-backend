@@ -7,6 +7,7 @@ import datetime
 import tempfile
 import sqlite3
 import threading
+import re
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, Any, Optional, List, Tuple
@@ -346,6 +347,49 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     return vectors
 
 
+def _normalize_query_vector(qvec: List[float]) -> np.ndarray:
+    arr = np.array([qvec], dtype="float32")
+    faiss.normalize_L2(arr)
+    return arr
+
+
+def extract_keyword_terms(question: str) -> List[str]:
+    q = (question or "").strip().lower()
+    if not q:
+        return []
+
+    q = re.sub(r"[^a-z0-9\-\s]", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    if not q:
+        return []
+
+    stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
+        "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "setup",
+        "set", "the", "this", "to", "up", "what", "where", "which", "who", "why", "with",
+        "module", "tell", "about"
+    }
+
+    tokens = [tok for tok in q.split() if len(tok) >= 3 and tok not in stopwords]
+    phrases: List[str] = []
+
+    for n in (3, 2):
+        for i in range(len(tokens) - n + 1):
+            phrase = " ".join(tokens[i:i+n]).strip()
+            if len(phrase) >= 5:
+                phrases.append(phrase)
+
+    phrases.extend(tokens)
+
+    seen = set()
+    out: List[str] = []
+    for term in phrases:
+        if term not in seen:
+            seen.add(term)
+            out.append(term)
+    return out[:12]
+
+
 # =========================
 # Consolidated index loading (public/internal)
 # =========================
@@ -393,12 +437,12 @@ def fetch_chunks_from_meta(db_path: str, ids_1based: List[int]) -> List[Tuple[st
 
 def search_consolidated(tier: str, qvec: List[float], k: int = 12) -> List[Tuple[float, str, str]]:
     """
-    Returns list of (dist, chunk, source_filebasename) from consolidated index.
+    Returns list of (score, chunk, source_filebasename) from consolidated index.
     """
     index, db_path = load_consolidated_index(tier)
 
     with _FAISS_LOCK:
-        D, I = index.search(np.array([qvec]).astype("float32"), k=k)
+        D, I = index.search(_normalize_query_vector(qvec), k=k)
 
     # FAISS ids are 0-based; sqlite AUTOINCREMENT ids are 1-based
     ids_1based: List[int] = []
@@ -437,6 +481,19 @@ def keyword_chunks_from_consolidated(tier: str, needle: str, limit: int = 8) -> 
         return [(r[0] or "", r[1] or "") for r in cur.fetchall() if r and r[1]]
     finally:
         conn.close()
+
+
+def keyword_chunks_from_terms(tier: str, terms: List[str], per_term_limit: int = 4) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for term in terms:
+        for fp, ch in keyword_chunks_from_consolidated(tier, term, limit=per_term_limit):
+            key = ((fp or "").lower(), (ch or "").strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((fp, ch))
+    return out
 
 
 # =========================
@@ -523,7 +580,7 @@ def sync_sharepoint_download_only(
     if tier not in ("public", "internal"):
         raise ValueError("tier must be public or internal")
 
-    allowed_exts = allowed_exts or ["pdf", "docx", "txt"]
+    allowed_exts = allowed_exts or ["pdf"]
     allowed_exts = [e.lower().lstrip(".") for e in allowed_exts]
 
     access_token = authenticate_graph()
@@ -727,35 +784,36 @@ def retrieve_chunks_with_sources(
 
     scored: List[Tuple[float, str, str]] = []
 
-    # --- Optional keyword anti-regression for ShipERP variants ---
-    q_lc = question.lower()
-    needles: List[str] = []
-    if ("shiperp" in q_lc) or ("ship erp" in q_lc) or ("ship-erp" in q_lc):
-        needles = ["shiperp", "ship erp", "ship-erp"]
+    # --- Keyword fallback for exact module/product wording ---
+    try:
+        keyword_terms = extract_keyword_terms(" ".join(query_texts))
+        shiperp_terms = []
+        q_lc = base_question.lower()
+        if ("shiperp" in q_lc) or ("ship erp" in q_lc) or ("ship-erp" in q_lc):
+            shiperp_terms = ["shiperp", "ship erp", "ship-erp"]
 
-    if needles:
-        try:
-            for needle in needles:
-                rows = keyword_chunks_from_consolidated("public", needle, limit=10)
+        keyword_terms = shiperp_terms + [t for t in keyword_terms if t not in shiperp_terms]
+
+        if keyword_terms:
+            rows = keyword_chunks_from_terms("public", keyword_terms, per_term_limit=4)
+            for fp, ch in rows:
+                src = os.path.basename(fp) if fp else "unknown"
+                ch = (ch or "").strip()
+                if ch:
+                    scored.append((2.0, ch, src))
+
+            if tier == "internal":
+                rows = keyword_chunks_from_terms("internal", keyword_terms, per_term_limit=4)
                 for fp, ch in rows:
                     src = os.path.basename(fp) if fp else "unknown"
                     ch = (ch or "").strip()
                     if ch:
-                        scored.append((-1.0, ch, src))
+                        scored.append((2.0, ch, src))
+    except Exception as e:
+        if debug:
+            print("[RAG][DEBUG] keyword fallback error:", e)
 
-            if tier == "internal":
-                for needle in needles:
-                    rows = keyword_chunks_from_consolidated("internal", needle, limit=10)
-                    for fp, ch in rows:
-                        src = os.path.basename(fp) if fp else "unknown"
-                        ch = (ch or "").strip()
-                        if ch:
-                            scored.append((-1.0, ch, src))
-        except Exception as e:
-            if debug:
-                print("[RAG][DEBUG] keyword fallback error:", e)
-
-        # --- consolidated public/internal ---
+    # --- consolidated public/internal ---
     try:
         for qvec in qvecs:
             scored.extend(search_consolidated("public", qvec, k=k_public_internal))
@@ -781,7 +839,7 @@ def retrieve_chunks_with_sources(
             idx = faiss.read_index(index_path)
             for qvec in qvecs:
                 with _FAISS_LOCK:
-                    D, I = idx.search(np.array([qvec]).astype("float32"), k=k_per_doc_upload)
+                    D, I = idx.search(_normalize_query_vector(qvec), k=k_per_doc_upload)
 
                 for dist, ci in zip(D[0], I[0]):
                     if 0 <= ci < len(chunks_list):
@@ -795,7 +853,7 @@ def retrieve_chunks_with_sources(
     if not scored:
         return [], []
 
-    scored.sort(key=lambda x: x[0])
+    scored.sort(key=lambda x: x[0], reverse=True)
 
     # Keep more candidates than final output, then rerank
     candidates: List[Tuple[str, str]] = []
@@ -958,8 +1016,10 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(chunks, f)
 
-        idx = faiss.IndexFlatL2(VECTOR_DIM)
-        idx.add(np.array(vectors).astype("float32"))
+        idx = faiss.IndexFlatIP(VECTOR_DIM)
+        vecs = np.array(vectors, dtype="float32")
+        faiss.normalize_L2(vecs)
+        idx.add(vecs)
         faiss.write_index(idx, index_path)
 
         return {"message": f"Document '{document_name}' uploaded privately for {email}."}
@@ -998,14 +1058,14 @@ def trigger_sync(background_tasks: BackgroundTasks):
                 tier="public",
                 sp_subpath=SP_PUBLIC_SUBPATH,
                 dest_root=DESTINATION_FOLDER,
-                allowed_exts=["pdf", "docx", "txt"],
+                allowed_exts=["pdf"],
             )
             # internal
             sync_sharepoint_download_only(
                 tier="internal",
                 sp_subpath=SP_INTERNAL_SUBPATH,
                 dest_root=DESTINATION_FOLDER,
-                allowed_exts=["pdf", "docx", "txt"],
+                allowed_exts=["pdf"],
             )
         except Exception as e:
             print("[SYNC ERROR]", str(e))
@@ -1042,10 +1102,19 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
             and os.path.exists(os.path.join(INDEXES_FOLDER, "internal", "meta.db"))
         )
 
-        retrieval_query = question
+        retrieval_query = rewrite_question_for_retrieval(
+            current_question=question,
+            summary="",
+            recent_messages=[{"role": "user", "content": question}],
+        )
+        retrieval_queries = build_retrieval_queries(
+            original_question=question,
+            rewritten_question=retrieval_query,
+        )
 
         chunks, sources = retrieve_chunks_with_sources(
             question=retrieval_query,
+            extra_queries=retrieval_queries,
             tier=tier,
             user_upload_folder=user_upload_folder,
             k_public_internal=24,
@@ -1092,7 +1161,7 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
             strict_answer = answer_from_docs_strict(
-                question=message,
+                question=question,
                 docs_block=docs_block,
                 max_tokens=900
             )
@@ -1306,8 +1375,6 @@ async def chat_api(
     )
 
     try:
-        import re
-
         # --- Chat state ---
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
@@ -1357,13 +1424,13 @@ async def chat_api(
 
         # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
-            current_question=message,
+            current_question=question,
             summary=summary,
             recent_messages=state.get("messages", []),
         )
 
         retrieval_queries = build_retrieval_queries(
-            original_question=message,
+            original_question=question,
             rewritten_question=retrieval_query,
         )
 
@@ -1447,7 +1514,7 @@ async def chat_api(
 
         # strict second pass only for normal doc-first questions
         if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
-            strict_answer = answer_from_docs_strict(question=message, docs_block=docs_block, max_tokens=900)
+            strict_answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=900)
             if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
                 answer = strict_answer
 
