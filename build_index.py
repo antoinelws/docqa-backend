@@ -1,242 +1,211 @@
-# build_index.py
 import os
-import time
-import gc
+import json
 import sqlite3
+import argparse
 from pathlib import Path
 from typing import List, Tuple
 
 import faiss
 import numpy as np
 import pdfplumber
-from tqdm import tqdm
+from dotenv import load_dotenv
 from openai import OpenAI
+
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_DIM = 3072
 
-CHUNK_SIZE_CHARS = 1000
-MAX_CHARS_PER_CHUNK = 6000
-BATCH_SIZE = 16
-MAX_PAGES = 150
-
-# Fail fast if missing
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def extract_text_pdf(path: Path) -> str:
-    parts = []
-    with pdfplumber.open(str(path)) as pdf:
-        n = min(len(pdf.pages), MAX_PAGES)
-        for i in range(n):
-            page = pdf.pages[i]
-            t = page.extract_text()
-            if t:
-                parts.append(t)
-
-            # periodic GC while iterating pages
-            if i > 0 and i % 25 == 0:
-                gc.collect()
-
-    return "\n".join(parts)
+    try:
+        with pdfplumber.open(str(path)) as pdf:
+            pages = []
+            for page in pdf.pages:
+                pages.append(page.extract_text() or "")
+            return "\n".join(pages).strip()
+    except Exception as e:
+        print(f"[WARN] failed to read PDF {path}: {e}")
+        return ""
 
 
-
-def extract_text(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext == ".pdf":
-        return extract_text_pdf(path)
-    return ""
-
-
-def chunk_text(text: str, max_chars: int = CHUNK_SIZE_CHARS) -> List[str]:
-    """
-    Sentence-ish splitter with hard fallback for long segments.
-    Works better on bullet lists / tables than split(". ").
-    """
+def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
 
-    # Split on newlines first (often better than ". " for docs)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return []
-
+    sentences = text.split(". ")
     chunks: List[str] = []
     buf = ""
 
-    def flush():
-        nonlocal buf
-        if buf.strip():
-            chunks.append(buf.strip())
-        buf = ""
-
-    for ln in lines:
-        # If a single line is extremely long, hard-split it
-        if len(ln) > max_chars:
-            # flush current
-            flush()
-            for i in range(0, len(ln), max_chars):
-                part = ln[i:i + max_chars].strip()
-                if part:
-                    chunks.append(part)
+    for s in sentences:
+        s = (s or "").strip()
+        if not s:
             continue
 
-        candidate = (buf + "\n" + ln).strip() if buf else ln
+        candidate = (buf + s + ". ").strip()
         if len(candidate) <= max_chars:
-            buf = candidate
+            buf = candidate + " "
         else:
-            flush()
-            buf = ln
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = (s + ". ").strip()
 
-    flush()
+    if buf.strip():
+        chunks.append(buf.strip())
+
     return chunks
 
 
-def clean_chunks(chunks: List[str]) -> List[str]:
-    clean: List[str] = []
-    for ch in chunks:
-        if not ch:
+def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
+    clean_texts: List[str] = []
+    for t in texts:
+        if not isinstance(t, str):
             continue
-        ch = ch.strip()
-        if not ch:
+        t = t.strip()
+        if len(t) < 10:
             continue
-        if len(ch) > MAX_CHARS_PER_CHUNK:
-            ch = ch[:MAX_CHARS_PER_CHUNK]
-        # remove super tiny chunks
-        if len(ch) < 20:
-            continue
-        clean.append(ch)
-    return clean
+        if len(t) > 6000:
+            t = t[:6000]
+        clean_texts.append(t)
 
-
-def embed_batch(texts: List[str], max_retries: int = 5) -> List[List[float]]:
-    texts = [t for t in texts if isinstance(t, str) and t.strip()]
-    if not texts:
+    if not clean_texts:
         return []
 
-    for attempt in range(max_retries):
+    vectors: List[List[float]] = []
+    for i in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[i:i + batch_size]
         try:
-            resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-            return [d.embedding for d in resp.data]
+            resp = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=batch,
+            )
+            vectors.extend([d.embedding for d in resp.data])
         except Exception as e:
-            wait = min(2 ** attempt, 20)
-            print(f"[EMBED] error (attempt {attempt+1}/{max_retries}): {e} -> sleep {wait}s", flush=True)
-            time.sleep(wait)
+            print(f"[WARN] embedding batch failed: {e}")
 
-    # give up this batch
-    return []
+    return vectors
 
 
-def build_index(docs_path: str, out_path: str):
-    docs_path = Path(docs_path)
-    out_path = Path(out_path)
+def build_rows_from_pdfs(docs_path: Path) -> List[Tuple[str, str]]:
+    rows: List[Tuple[str, str]] = []
+
+    files = sorted(docs_path.rglob("*.pdf"))
+    print(f"Found {len(files)} PDF file(s) under {docs_path}")
+
+    for file_path in files:
+        print(f"Reading: {file_path}")
+        text = extract_text_pdf(file_path)
+        if not text:
+            continue
+
+        chunks = chunk_text(text, max_chars=1000)
+        for chunk in chunks:
+            if chunk.strip():
+                rows.append((str(file_path), chunk.strip()))
+
+    return rows
+
+
+def write_meta_db(db_path: Path, rows: List[Tuple[str, str]]):
+    if db_path.exists():
+        db_path.unlink()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file TEXT NOT NULL,
+                chunk TEXT NOT NULL
+            )
+            """
+        )
+        cur.executemany(
+            "INSERT INTO chunks (file, chunk) VALUES (?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_index(docs_dir: str, out_dir: str):
+    docs_path = Path(docs_dir)
+    out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # SQLite
-    db_path = out_path / "meta.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file TEXT NOT NULL,
-            chunk TEXT NOT NULL
+    if not docs_path.exists():
+        raise FileNotFoundError(f"Docs folder does not exist: {docs_path}")
+
+    rows = build_rows_from_pdfs(docs_path)
+    if not rows:
+        raise RuntimeError(f"No text chunks found in {docs_path}")
+
+    embed_inputs = [
+        f"Source file: {os.path.basename(file_path)}\n\nContent:\n{chunk}"
+        for file_path, chunk in rows
+    ]
+
+    print(f"Embedding {len(embed_inputs)} chunk(s)...")
+    vectors = embed_texts(embed_inputs)
+    if not vectors:
+        raise RuntimeError("No embeddings were generated")
+
+    if len(vectors) != len(rows):
+        raise RuntimeError(
+            f"Embedding count mismatch: {len(vectors)} embeddings for {len(rows)} rows"
         )
-    """)
-    conn.commit()
 
-    # FAISS
+    vecs = np.array(vectors, dtype="float32")
+    faiss.normalize_L2(vecs)
+
     index = faiss.IndexFlatIP(VECTOR_DIM)
-    faiss_path_tmp = out_path / "faiss.index.tmp"
-    faiss_path_final = out_path / "faiss.index"
+    index.add(vecs)
 
-    files = sorted(list(docs_path.rglob("*.pdf")))
-    print(f"Found {len(files)} PDF file(s) under {docs_path}", flush=True)
+    faiss_path = out_path / "faiss.index"
+    db_path = out_path / "meta.db"
 
-    inserted = 0
-    pending_rows: List[Tuple[str, str]] = []
+    print(f"Writing FAISS index to {faiss_path}")
+    faiss.write_index(index, str(faiss_path))
 
-    for f in tqdm(files):
-        try:
-            print(f"Processing file: {f}", flush=True)
+    print(f"Writing sqlite metadata to {db_path}")
+    write_meta_db(db_path, rows)
 
-            text = extract_text(f)
-            if not text.strip():
-                continue
+    stats = {
+        "docs_dir": str(docs_path),
+        "out_dir": str(out_path),
+        "files_indexed": len(sorted(docs_path.rglob('*.pdf'))),
+        "chunks_indexed": len(rows),
+        "embedding_model": EMBEDDING_MODEL,
+        "vector_dim": VECTOR_DIM,
+        "faiss_metric": "IndexFlatIP with L2-normalized vectors (cosine-style retrieval)",
+    }
 
-            chunks = clean_chunks(chunk_text(text))
-            if not chunks:
-                continue
+    with open(out_path / "build_stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
 
-            f_str = str(f)
-
-            for i in range(0, len(chunks), BATCH_SIZE):
-                batch_chunks = chunks[i:i + BATCH_SIZE]
-            
-                batch_embed_inputs = [
-                    f"Source document: {f.name}\n\nContent:\n{chunk}"
-                    for chunk in batch_chunks
-                ]
-            
-                embs = embed_batch(batch_embed_inputs)
-
-                if not embs:
-                    print(f"[WARN] embeddings failed for batch in {f} (skipping batch)", flush=True)
-                    continue
-
-                if len(embs) != len(batch_chunks):
-                    print(f"[WARN] embedding count mismatch in {f}: got {len(embs)} for {len(batch_chunks)} (skipping batch)", flush=True)
-                    continue
-
-                vecs = np.array(embs, dtype="float32")
-                faiss.normalize_L2(vecs)
-                index.add(vecs)
-
-                for ch in batch_chunks:
-                    pending_rows.append((f_str, ch))
-
-                inserted += len(batch_chunks)
-
-                if len(pending_rows) >= 2000:
-                    cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", pending_rows)
-                    conn.commit()
-                    pending_rows.clear()
-
-            # crash-safety: write tmp after each file
-            faiss.write_index(index, str(faiss_path_tmp))
-
-        except Exception as e:
-            print(f"[ERROR] failed processing {f}: {e}", flush=True)
-
-        finally:
-            # Aggressive cleanup between files
-            gc.collect()
-
-    if pending_rows:
-        cur.executemany("INSERT INTO chunks (file, chunk) VALUES (?, ?)", pending_rows)
-        conn.commit()
-        pending_rows.clear()
-
-    faiss.write_index(index, str(faiss_path_final))
-    if faiss_path_tmp.exists():
-        try:
-            faiss_path_tmp.unlink()
-        except Exception:
-            pass
-
-    conn.close()
-
-    print(f"✅ Index build complete: {faiss_path_final} + {db_path}", flush=True)
-    print(f"Total vectors: {index.ntotal}", flush=True)
+    print("✅ Index build complete")
+    print(json.dumps(stats, indent=2))
 
 
-if __name__ == "__main__":
-    import argparse
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--docs", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--docs", required=True, help="Source docs directory, e.g. /data/documents/public")
+    parser.add_argument("--out", required=True, help="Output index directory, e.g. /data/indexes/public")
     args = parser.parse_args()
 
     build_index(args.docs, args.out)
+
+
+if __name__ == "__main__":
+    main()
