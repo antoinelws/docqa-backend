@@ -9,7 +9,6 @@ from typing import List, Tuple
 import faiss
 import numpy as np
 import pdfplumber
-import docx
 from tqdm import tqdm
 from openai import OpenAI
 
@@ -42,21 +41,11 @@ def extract_text_pdf(path: Path) -> str:
     return "\n".join(parts)
 
 
-def extract_text_docx(path: Path) -> str:
-    d = docx.Document(str(path))
-    parts = []
-    for p in d.paragraphs:
-        if p.text:
-            parts.append(p.text)
-    return "\n".join(parts)
-
 
 def extract_text(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".pdf":
         return extract_text_pdf(path)
-    if ext == ".docx":
-        return extract_text_docx(path)
     return ""
 
 
@@ -159,12 +148,12 @@ def build_index(docs_path: str, out_path: str):
     conn.commit()
 
     # FAISS
-    index = faiss.IndexFlatL2(VECTOR_DIM)
+    index = faiss.IndexFlatIP(VECTOR_DIM)
     faiss_path_tmp = out_path / "faiss.index.tmp"
     faiss_path_final = out_path / "faiss.index"
 
-    files = sorted(list(docs_path.rglob("*.pdf")) + list(docs_path.rglob("*.docx")))
-    print(f"Found {len(files)} files (PDF+DOCX) under {docs_path}", flush=True)
+    files = sorted(list(docs_path.rglob("*.pdf")))
+    print(f"Found {len(files)} PDF file(s) under {docs_path}", flush=True)
 
     inserted = 0
     pending_rows: List[Tuple[str, str]] = []
@@ -202,6 +191,7 @@ def build_index(docs_path: str, out_path: str):
                     continue
 
                 vecs = np.array(embs, dtype="float32")
+                faiss.normalize_L2(vecs)
                 index.add(vecs)
 
                 for ch in batch_chunks:
