@@ -178,7 +178,21 @@ def is_general_shiperp_question(question: str) -> bool:
 
     return any(p in q for p in patterns)
 
+def is_doc_domain_question(question: str) -> bool:
+    q = (question or "").strip().lower()
 
+    domain_terms = [
+        "shiperp", "ship erp", "ship-erp",
+        "sales order", "so module", "shipset", "ship set",
+        "break bulk", "breakbulk",
+        "carrier", "carriers",
+        "ewm", "ecc", "adb",
+        "/erpis/", "/serpc/", "/serpewm/",
+        "delivery", "shipment", "shipping",
+        "pack proposal", "induction point", "consolidation service",
+    ]
+
+    return any(term in q for term in domain_terms)
 def answer_from_docs_strict(question: str, docs_block: str, max_tokens: int = 700) -> str:
     """
     Strict doc-only pass.
@@ -1154,9 +1168,10 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
                 "You are the ShipERP assistant.\n"
                 "You must answer FIRST using the documentation excerpts provided below.\n"
                 "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-                "If the documentation does NOT contain the answer, say explicitly:\n"
+                "If the documentation does NOT contain the answer, say exactly:\n"
                 "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-                "Only then, provide a concise general-knowledge answer.\n"
+                "Then answer the question from general knowledge in a normal helpful way.\n"
+                "For general world-knowledge questions, do not stop at saying the docs do not mention it.\n"
                 "Do not mix documentation-based information and general knowledge in the same sentence.\n"
                 "Be practical and sufficiently detailed to be useful.\n"
                 "Do NOT include any 'Sources' section in your answer."
@@ -1170,13 +1185,15 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
         answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
-        if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
+        doc_domain_q = is_doc_domain_question(question)
+
+        if has_docs and doc_domain_q and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
             strict_answer = answer_from_docs_strict(
                 question=question,
                 docs_block=docs_block,
                 max_tokens=900,
             )
-
+        
             if (
                 strict_answer
                 and strict_answer.strip()
@@ -1512,7 +1529,9 @@ async def chat_api(
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
-        if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
+        doc_domain_q = is_doc_domain_question(message)
+
+        if has_docs and doc_domain_q and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
             strict_answer = answer_from_docs_strict(
                 question=message,
                 docs_block=docs_block,
@@ -1713,9 +1732,10 @@ def process_slack_question(question: str, response_url: str):
                     "You are the ShipERP assistant.\n"
                     "You must answer FIRST using the documentation excerpts provided below.\n"
                     "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-                    "If the documentation does NOT contain the answer, say explicitly:\n"
+                    "If the documentation does NOT contain the answer, say exactly:\n"
                     "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
-                    "Only then, provide a concise general-knowledge answer.\n"
+                    "Then answer the question from general knowledge in a normal helpful way.\n"
+                    "For general world-knowledge questions, do not stop at saying the docs do not mention it.\n"
                     "Do not mix documentation-based information and general knowledge in the same sentence.\n"
                     "Be practical and sufficiently detailed to be useful.\n"
                     "Do NOT include any 'Sources' section in your answer."
