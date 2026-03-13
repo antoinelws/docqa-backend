@@ -35,17 +35,7 @@ from fastapi import UploadFile, File
 from pathlib import Path
 import shutil
 
-VIDEO_RAW_DIR = Path("/data/videos/raw")
-VIDEO_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-@app.post("/upload-video")
-async def upload_video(file: UploadFile = File(...)):
-    dest = VIDEO_RAW_DIR / file.filename
-
-    with dest.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    return {"status": "uploaded", "file": file.filename}
 
 
 # =========================
@@ -418,6 +408,22 @@ def extract_keyword_terms(question: str) -> List[str]:
             seen.add(term)
             out.append(term)
     return out[:12]
+
+# =========================
+# API for video upload
+# =========================
+
+VIDEO_RAW_DIR = Path("/data/videos/raw")
+VIDEO_RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.post("/upload-video")
+async def upload_video(file: UploadFile = File(...)):
+    dest = VIDEO_RAW_DIR / file.filename
+
+    with dest.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {"status": "uploaded", "file": file.filename}
 
 
 # =========================
