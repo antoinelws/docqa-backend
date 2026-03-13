@@ -1,4 +1,3 @@
-# main.py
 import os
 import json
 import glob
@@ -51,7 +50,7 @@ if not OPENAI_API_KEY:
 
 # Models
 MODEL_MINI = os.getenv("OPENAI_MODEL_MINI", "gpt-4o-mini")
-MODEL_BIG  = os.getenv("OPENAI_MODEL_BIG", "gpt-4o")
+MODEL_BIG = os.getenv("OPENAI_MODEL_BIG", "gpt-4o")
 
 # SharePoint
 DRIVE_ID = os.getenv(
@@ -62,8 +61,8 @@ FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "AI")  # root folder in drive
 
 # Storage
 BASE_STORAGE = "/data"
-DESTINATION_FOLDER = os.path.join(BASE_STORAGE, "documents")  # /data/documents/{tier}/...
-INDEXES_FOLDER = os.path.join(BASE_STORAGE, "indexes")        # /data/indexes/{tier}/faiss.index + meta.db
+DESTINATION_FOLDER = os.path.join(BASE_STORAGE, "documents")   # /data/documents/{tier}/...
+INDEXES_FOLDER = os.path.join(BASE_STORAGE, "indexes")         # /data/indexes/{tier}/faiss.index + meta.db
 LOGS_FOLDER = os.path.join(BASE_STORAGE, "logs")
 
 os.makedirs(DESTINATION_FOLDER, exist_ok=True)
@@ -102,8 +101,10 @@ def _load_users(path: str) -> Dict[str, Any]:
             return json.load(f) or {}
     return {}
 
+
 INTERNAL_USERS = _load_users(INTERNAL_USER_FILE)  # email -> True OR {"password_hash": "..."}
 PUBLIC_USERS = _load_users(PUBLIC_USER_FILE)      # email -> True OR {"password_hash": "..."}
+
 
 def is_allowed(users: Dict[str, Any], email: str) -> bool:
     v = users.get(email)
@@ -112,6 +113,7 @@ def is_allowed(users: Dict[str, Any], email: str) -> bool:
     if isinstance(v, dict) and isinstance(v.get("password_hash"), str) and v["password_hash"].strip():
         return True
     return False
+
 
 def get_user_tier(email: str) -> Optional[str]:
     email = (email or "").strip().lower()
@@ -123,6 +125,7 @@ def get_user_tier(email: str) -> Optional[str]:
         return "public"
     return None
 
+
 def get_password_hash(users: Dict[str, Any], email: str) -> Optional[str]:
     v = users.get(email)
     if isinstance(v, dict):
@@ -130,6 +133,7 @@ def get_password_hash(users: Dict[str, Any], email: str) -> Optional[str]:
         if isinstance(ph, str) and ph.strip():
             return ph.strip()
     return None
+
 
 def verify_password(email: str, password: str) -> bool:
     email = (email or "").strip().lower()
@@ -142,7 +146,7 @@ def verify_password(email: str, password: str) -> bool:
 
 
 # =========================
-# OpenAI client + wrappers (SDK v2.x)
+# OpenAI client + wrappers
 # =========================
 def chat_completion(model: str, messages: List[dict], max_completion_tokens: int = 700) -> str:
     resp = _openai_client.chat.completions.create(
@@ -151,6 +155,7 @@ def chat_completion(model: str, messages: List[dict], max_completion_tokens: int
         max_completion_tokens=max_completion_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
+
 
 def is_general_shiperp_question(question: str) -> bool:
     q = (question or "").strip().lower()
@@ -205,13 +210,6 @@ def rewrite_question_for_retrieval(
 ) -> str:
     """
     Rewrite the user's latest message into a standalone, documentation-oriented retrieval query.
-
-    Goals:
-    - resolve follow-up references
-    - normalize abbreviations and vague wording
-    - prefer product/module wording likely to appear in documentation
-    - do NOT answer the question
-    - return only one rewritten query
     """
     current_question = (current_question or "").strip()
     if not current_question:
@@ -260,6 +258,7 @@ def rewrite_question_for_retrieval(
     except Exception as e:
         print("[RAG][rewrite_question_for_retrieval] failed:", e)
         return current_question
+
 
 def rerank_chunks_with_llm(
     question: str,
@@ -318,6 +317,7 @@ def rerank_chunks_with_llm(
         print("[RAG][rerank_chunks_with_llm] failed:", e)
         return chunks_with_sources[:max_keep]
 
+
 def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     clean_texts: List[str] = []
     for t in texts:
@@ -335,7 +335,7 @@ def embed_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
 
     vectors: List[List[float]] = []
     for i in range(0, len(clean_texts), batch_size):
-        batch = clean_texts[i : i + batch_size]
+        batch = clean_texts[i:i + batch_size]
         try:
             resp = _openai_client.embeddings.create(
                 model=EMBEDDING_MODEL,
@@ -375,7 +375,7 @@ def extract_keyword_terms(question: str) -> List[str]:
 
     for n in (3, 2):
         for i in range(len(tokens) - n + 1):
-            phrase = " ".join(tokens[i:i+n]).strip()
+            phrase = " ".join(tokens[i:i + n]).strip()
             if len(phrase) >= 5:
                 phrases.append(phrase)
 
@@ -391,9 +391,10 @@ def extract_keyword_terms(question: str) -> List[str]:
 
 
 # =========================
-# Consolidated index loading (public/internal)
+# Consolidated index loading
 # =========================
 _FAISS_LOCK = threading.Lock()
+
 
 @lru_cache(maxsize=4)
 def load_consolidated_index(tier: str):
@@ -415,6 +416,7 @@ def load_consolidated_index(tier: str):
     index = faiss.read_index(str(faiss_path))
     return index, str(db_path)
 
+
 def fetch_chunks_from_meta(db_path: str, ids_1based: List[int]) -> List[Tuple[str, str]]:
     """
     Returns list of (file, chunk) for given sqlite row ids (1-based).
@@ -435,6 +437,7 @@ def fetch_chunks_from_meta(db_path: str, ids_1based: List[int]) -> List[Tuple[st
     finally:
         conn.close()
 
+
 def search_consolidated(tier: str, qvec: List[float], k: int = 12) -> List[Tuple[float, str, str]]:
     """
     Returns list of (score, chunk, source_filebasename) from consolidated index.
@@ -444,26 +447,25 @@ def search_consolidated(tier: str, qvec: List[float], k: int = 12) -> List[Tuple
     with _FAISS_LOCK:
         D, I = index.search(_normalize_query_vector(qvec), k=k)
 
-    # FAISS ids are 0-based; sqlite AUTOINCREMENT ids are 1-based
     ids_1based: List[int] = []
-    dists: List[float] = []
-    for dist, idx0 in zip(D[0], I[0]):
+    scores: List[float] = []
+    for score, idx0 in zip(D[0], I[0]):
         if idx0 < 0:
             continue
         ids_1based.append(int(idx0) + 1)
-        dists.append(float(dist))
+        scores.append(float(score))
 
     rows = fetch_chunks_from_meta(db_path, ids_1based)
     scored: List[Tuple[float, str, str]] = []
-    for dist, (file_path, chunk) in zip(dists, rows):
+    for score, (file_path, chunk) in zip(scores, rows):
         src = os.path.basename(file_path) if file_path else "unknown"
-        scored.append((dist, (chunk or "").strip(), src))
+        scored.append((score, (chunk or "").strip(), src))
     return scored
+
 
 def keyword_chunks_from_consolidated(tier: str, needle: str, limit: int = 8) -> List[Tuple[str, str]]:
     """
-    Keyword fallback: fetch chunks that literally contain 'needle' (case-insensitive)
-    from the consolidated sqlite meta.db for a given tier.
+    Keyword fallback: fetch chunks that literally contain 'needle' (case-insensitive).
     Returns list of (file, chunk).
     """
     needle = (needle or "").strip().lower()
@@ -505,12 +507,14 @@ if not SSO_SECRET:
 
 _sso = URLSafeTimedSerializer(SSO_SECRET, salt="docqa-sso-v1")
 
+
 def issue_sso_token(email: str) -> str:
     email = (email or "").strip().lower()
     tier = get_user_tier(email)
     if not tier:
         raise HTTPException(status_code=403, detail="Access denied")
     return _sso.dumps({"email": email})
+
 
 def verify_sso_token(token: str, max_age_seconds: int = 300) -> Dict[str, Any]:
     try:
@@ -522,6 +526,7 @@ def verify_sso_token(token: str, max_age_seconds: int = 300) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Token expired")
     except BadSignature:
         raise HTTPException(status_code=401, detail="Invalid token")
+
 
 def _is_allowed_next(url: str) -> bool:
     try:
@@ -535,7 +540,7 @@ def _is_allowed_next(url: str) -> bool:
 
 
 # =========================
-# SharePoint auth + sync (download only)
+# SharePoint auth + sync
 # =========================
 def authenticate_graph() -> str:
     app = ConfidentialClientApplication(
@@ -548,18 +553,20 @@ def authenticate_graph() -> str:
         raise Exception(f"Authentication failed: {result}")
     return result["access_token"]
 
+
 def log_sync_activity(filename: str, user_name: str, user_email: str):
     ts = datetime.datetime.utcnow().isoformat()
     with open(HISTORY_LOG, "a", encoding="utf-8") as f:
         f.write(f"{ts},{filename},{user_name},{user_email}\n")
 
+
 def _graph_children_by_path(headers: dict, drive_id: str, path: str) -> List[dict]:
-    # path is like "AI/public/PPT_PDF"
     encoded = path.replace(" ", "%20")
     url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded}:/children"
     resp = requests.get(url, headers=headers, timeout=60)
     resp.raise_for_status()
     return resp.json().get("value", []) or []
+
 
 def sync_sharepoint_download_only(
     tier: str,
@@ -645,7 +652,7 @@ def sync_sharepoint_download_only(
 
 
 # =========================
-# Upload parsing + chunking (uploads only)
+# Upload parsing + chunking
 # =========================
 def extract_text_upload(filename: str, content: bytes) -> str:
     ext = (filename or "").lower().split(".")[-1]
@@ -672,6 +679,7 @@ def extract_text_upload(filename: str, content: bytes) -> str:
 
     return ""
 
+
 def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
     text = (text or "").strip()
     if not text:
@@ -694,6 +702,7 @@ def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
         chunks.append(buf.strip())
     return chunks
 
+
 def _safe_email_folder(email: str) -> str:
     return (
         (email or "")
@@ -705,9 +714,8 @@ def _safe_email_folder(email: str) -> str:
 
 
 # =========================
-# Retrieval: consolidated (public/internal) + uploads per-doc
+# Retrieval
 # =========================
-
 def build_retrieval_queries(
     original_question: str,
     rewritten_question: str,
@@ -755,7 +763,8 @@ def build_retrieval_queries(
         print("[RAG][build_retrieval_queries] failed:", e)
 
     return queries
-    
+
+
 def retrieve_chunks_with_sources(
     question: str,
     tier: str,
@@ -784,7 +793,7 @@ def retrieve_chunks_with_sources(
 
     scored: List[Tuple[float, str, str]] = []
 
-    # --- Keyword fallback for exact module/product wording ---
+    # --- Keyword fallback ---
     try:
         keyword_terms = extract_keyword_terms(" ".join(query_texts))
         shiperp_terms = []
@@ -841,21 +850,20 @@ def retrieve_chunks_with_sources(
                 with _FAISS_LOCK:
                     D, I = idx.search(_normalize_query_vector(qvec), k=k_per_doc_upload)
 
-                for dist, ci in zip(D[0], I[0]):
+                for score, ci in zip(D[0], I[0]):
                     if 0 <= ci < len(chunks_list):
                         c = (chunks_list[ci] or "").strip()
                         if c:
-                            scored.append((float(dist), c, f"upload:{base}"))
+                            scored.append((float(score), c, f"upload:{base}"))
     except Exception as e:
         if debug:
-            print("[RAG][DEBUG] query_texts:", query_texts)
+            print("[RAG][DEBUG] uploads search error:", e)
 
     if not scored:
         return [], []
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Keep more candidates than final output, then rerank
     candidates: List[Tuple[str, str]] = []
     seen_chunks = set()
 
@@ -897,6 +905,7 @@ def retrieve_chunks_with_sources(
         print("[RAG][DEBUG] final sources:", final_sources)
 
     return final_chunks, final_sources
+
 
 # =========================
 # FastAPI app
@@ -941,6 +950,7 @@ def auth_login(email: str = Form(...), password: str = Form(...)):
     token = issue_sso_token(email_lc)
     return {"token": token, "email": email_lc}
 
+
 @app.get("/sso")
 def sso_entry(
     request: Request,
@@ -959,10 +969,12 @@ def sso_entry(
     request.session["user_email"] = email
     return RedirectResponse(url=next_url, status_code=HTTP_303_SEE_OTHER)
 
+
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
     return {"ok": True}
+
 
 @app.get("/me")
 def me(request: Request):
@@ -971,6 +983,7 @@ def me(request: Request):
     if not tier:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return {"email": email, "tier": tier}
+
 
 @app.get("/")
 def root():
@@ -1030,9 +1043,10 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
 
 # =========================
-# Sync now (download-only; indexing is separate)
+# Sync now
 # =========================
 sync_in_progress = False
+
 
 @app.post("/sync-now")
 def trigger_sync(background_tasks: BackgroundTasks):
@@ -1046,21 +1060,18 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
     sync_in_progress = True
 
-    # you can override these via env:
     SP_PUBLIC_SUBPATH = os.getenv("SP_PUBLIC_SUBPATH", "public")
     SP_INTERNAL_SUBPATH = os.getenv("SP_INTERNAL_SUBPATH", "internal")
 
     def run_and_release():
         global sync_in_progress
         try:
-            # public
             sync_sharepoint_download_only(
                 tier="public",
                 sp_subpath=SP_PUBLIC_SUBPATH,
                 dest_root=DESTINATION_FOLDER,
                 allowed_exts=["pdf"],
             )
-            # internal
             sync_sharepoint_download_only(
                 tier="internal",
                 sp_subpath=SP_INTERNAL_SUBPATH,
@@ -1163,11 +1174,9 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
             strict_answer = answer_from_docs_strict(
                 question=question,
                 docs_block=docs_block,
-                max_tokens=900
+                max_tokens=900,
             )
-        
-            # Only replace the original answer if the strict pass found a real doc-based answer.
-            # Otherwise keep the original fallback-to-general-knowledge response.
+
             if (
                 strict_answer
                 and strict_answer.strip()
@@ -1205,6 +1214,8 @@ def ask_question(request: Request, question: str = Form(...), debug: bool = Form
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # =========================
 # Conversation (per-user) + RAG
 # =========================
@@ -1238,7 +1249,6 @@ def _trim_messages_to_budget(messages: List[dict], budget_chars: int) -> List[di
 def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[dict]:
     """
     Keep recent USER messages and only short ASSISTANT messages.
-    Avoid feeding long assistant answers back into the model because they may contain errors.
     """
     cleaned: List[dict] = []
 
@@ -1258,11 +1268,11 @@ def build_safe_chat_history(messages: List[dict], max_turns: int = 6) -> List[di
 
     return cleaned
 
+
 def build_conversation_context_for_answer(messages: List[dict], max_user_turns: int = 4) -> str:
     """
     Build a compact conversational context for the final answer prompt.
-    Only includes recent USER questions, not assistant answers.
-    This avoids the model trying to answer old questions again.
+    Only includes recent USER questions.
     """
     user_msgs = [
         (m.get("content") or "").strip()
@@ -1283,7 +1293,8 @@ def build_conversation_context_for_answer(messages: List[dict], max_user_turns: 
         lines.append(f"Latest user question: {recent_user_msgs[-1]}")
 
     return "\n".join(lines)
-    
+
+
 def _get_user_state(user_id: str) -> Dict[str, Any]:
     if user_id not in CHAT_STORE:
         CHAT_STORE[user_id] = {"summary": "", "messages": []}
@@ -1340,13 +1351,13 @@ Rules:
 
     state["messages"] = keep
 
+
 @app.post("/chat-api")
 async def chat_api(
     request: Request,
     message: str = Form(...),
     debug: bool = Form(False),
 ):
-    # --- Auth via session ---
     email = (request.session.get("user_email") or "").strip().lower()
     tier = get_user_tier(email)
     if not tier:
@@ -1354,17 +1365,14 @@ async def chat_api(
 
     user_id = email
 
-    # --- Validate input ---
     message = (message or "").strip()
     if not message:
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
-    # --- Per-user uploads folder ---
     safe_email = _safe_email_folder(email)
     user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
     os.makedirs(user_upload_folder, exist_ok=True)
 
-    # --- Index presence diagnostics ---
     public_index_present = (
         os.path.exists(os.path.join(INDEXES_FOLDER, "public", "faiss.index"))
         and os.path.exists(os.path.join(INDEXES_FOLDER, "public", "meta.db"))
@@ -1375,12 +1383,10 @@ async def chat_api(
     )
 
     try:
-        # --- Chat state ---
         state = _get_user_state(user_id)
         state["messages"].append({"role": "user", "content": message, "ts": _now_iso()})
         _summarize_if_needed(user_id)
 
-        # --- Special case: chat memory questions ---
         msg_lc = message.lower().strip()
 
         def is_chat_memory_question(s: str) -> bool:
@@ -1419,18 +1425,16 @@ async def chat_api(
             state["messages"].append({"role": "assistant", "content": answer, "ts": _now_iso()})
             return {"answer": answer, "user_id": user_id, "sources": []}
 
-        # --- Build prompt context ---
         summary = (state.get("summary") or "").strip()
 
-        # --- Rewrite follow-up into standalone retrieval query ---
         retrieval_query = rewrite_question_for_retrieval(
-            current_question=question,
+            current_question=message,
             summary=summary,
             recent_messages=state.get("messages", []),
         )
 
         retrieval_queries = build_retrieval_queries(
-            original_question=question,
+            original_question=message,
             rewritten_question=retrieval_query,
         )
 
@@ -1445,7 +1449,7 @@ async def chat_api(
             chunk_max_chars=1200,
             debug=debug,
         )
-        
+
         has_docs = bool(chunks)
         docs_block = "\n\n".join(chunks) if chunks else "(none found for this question)"
         general_shiperp_q = is_general_shiperp_question(message)
@@ -1474,10 +1478,6 @@ async def chat_api(
                 "Do not include a 'Sources' section in the answer body."
             )
 
-        # IMPORTANT:
-        # - no messages.extend(recent)
-        # - we pass only the latest user question as the final user turn
-        # - conversation memory stays as system context, not active turns to re-answer
         messages = [{"role": "system", "content": system_rules}]
 
         if summary:
@@ -1512,13 +1512,15 @@ async def chat_api(
 
         answer = chat_completion(model=CHAT_MODEL, messages=messages, max_completion_tokens=900)
 
-        # strict second pass only for normal doc-first questions
         if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
-            strict_answer = answer_from_docs_strict(question=question, docs_block=docs_block, max_tokens=900)
+            strict_answer = answer_from_docs_strict(
+                question=message,
+                docs_block=docs_block,
+                max_tokens=900,
+            )
             if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
                 answer = strict_answer
 
-        # --- Final formatting ---
         if (answer or "").lower().startswith(FALLBACK_MARKER):
             final_answer = answer
             out_sources = []
@@ -1532,7 +1534,6 @@ async def chat_api(
 
         state["messages"].append({"role": "assistant", "content": assistant_to_store, "ts": _now_iso()})
 
-        # keep memory bounded
         if len(state["messages"]) > 2 * CHAT_SUMMARY_TRIGGER:
             state["messages"] = state["messages"][-CHAT_SUMMARY_TRIGGER:]
 
@@ -1550,6 +1551,7 @@ async def chat_api(
                     "docs_preview": chunks[:3],
                     "general_shiperp_q": general_shiperp_q,
                     "retrieval_query": retrieval_query,
+                    "retrieval_queries": retrieval_queries,
                 }
             )
 
@@ -1557,7 +1559,8 @@ async def chat_api(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-        
+
+
 # =========================
 # Admin pages
 # =========================
@@ -1566,6 +1569,7 @@ def require_internal(request: Request) -> str:
     if get_user_tier(email) != "internal":
         raise HTTPException(status_code=403, detail="Forbidden")
     return email
+
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(request: Request):
@@ -1586,6 +1590,7 @@ def admin_dashboard(request: Request):
         <p><a href="/admin/index-health">Index health (public/internal)</a></p>
     """
 
+
 @app.post("/admin/add")
 def add_internal_user(request: Request, email: str = Form(...)):
     require_internal(request)
@@ -1594,6 +1599,7 @@ def add_internal_user(request: Request, email: str = Form(...)):
     with open(INTERNAL_USER_FILE, "w", encoding="utf-8") as f:
         json.dump(INTERNAL_USERS, f, indent=2)
     return HTMLResponse(f"<p>{email} added as internal user. <a href='/admin'>Back</a></p>")
+
 
 @app.post("/admin/remove")
 def remove_internal_user(request: Request, email: str = Form(...)):
@@ -1605,6 +1611,7 @@ def remove_internal_user(request: Request, email: str = Form(...)):
             json.dump(INTERNAL_USERS, f, indent=2)
         return HTMLResponse(f"<p>{email} removed. <a href='/admin'>Back</a></p>")
     return HTMLResponse(f"<p>{email} not found. <a href='/admin'>Back</a></p>")
+
 
 @app.get("/admin/index-health")
 def index_health(request: Request):
@@ -1652,6 +1659,7 @@ def post_to_slack(response_url: str, text: str):
     except Exception as e:
         print("[DEBUG][SLACK] error posting follow-up:", e)
 
+
 def process_slack_question(question: str, response_url: str):
     user_email = "default@erp-is.com"  # internal identity for Slack
 
@@ -1664,8 +1672,19 @@ def process_slack_question(question: str, response_url: str):
             user_upload_folder = os.path.join(DESTINATION_FOLDER, "uploads", safe_email)
             os.makedirs(user_upload_folder, exist_ok=True)
 
+            retrieval_query = rewrite_question_for_retrieval(
+                current_question=question,
+                summary="",
+                recent_messages=[{"role": "user", "content": question}],
+            )
+            retrieval_queries = build_retrieval_queries(
+                original_question=question,
+                rewritten_question=retrieval_query,
+            )
+
             chunks, sources = retrieve_chunks_with_sources(
-                question=question,
+                question=retrieval_query,
+                extra_queries=retrieval_queries,
                 tier=tier,
                 user_upload_folder=user_upload_folder,
                 k_public_internal=18,
@@ -1677,18 +1696,30 @@ def process_slack_question(question: str, response_url: str):
 
             has_docs = bool(chunks)
             docs_block = "\n---\n".join(chunks) if chunks else "(none found for this question)"
+            general_shiperp_q = is_general_shiperp_question(question)
 
-            system_rules = (
-                "You are the ShipERP assistant.\n"
-                "You must answer FIRST using the documentation excerpts provided below.\n"
-                "If the documentation contains relevant information, base your answer strictly on it.\n\n"
-                "If the documentation does NOT contain the answer, say explicitly:\n"
-                '"The documentation does not mention this, but here is what I know from general knowledge:"\n\n'
-                "Only then, provide a concise general-knowledge answer.\n"
-                "Do not mix documentation-based information and general knowledge in the same sentence.\n"
-                "Be practical and sufficiently detailed to be useful.\n"
-                "Do NOT include any 'Sources' section in your answer."
-            )
+            if general_shiperp_q:
+                system_rules = (
+                    "You are the ShipERP assistant.\n"
+                    "The user is asking a broad, simple question about what ShipERP is or does.\n"
+                    "Use the documentation excerpts if they help.\n"
+                    "If they are incomplete, you may answer from general knowledge as well.\n"
+                    "Prefer a simple, clear, high-level explanation suitable for a first-time user.\n"
+                    "Do not invent highly specific implementation details unless supported by the documentation excerpts.\n"
+                    "Do not include a 'Sources' section in your answer."
+                )
+            else:
+                system_rules = (
+                    "You are the ShipERP assistant.\n"
+                    "You must answer FIRST using the documentation excerpts provided below.\n"
+                    "If the documentation contains relevant information, base your answer strictly on it.\n\n"
+                    "If the documentation does NOT contain the answer, say explicitly:\n"
+                    "\"The documentation does not mention this, but here is what I know from general knowledge:\"\n\n"
+                    "Only then, provide a concise general-knowledge answer.\n"
+                    "Do not mix documentation-based information and general knowledge in the same sentence.\n"
+                    "Be practical and sufficiently detailed to be useful.\n"
+                    "Do NOT include any 'Sources' section in your answer."
+                )
 
             messages = [
                 {"role": "system", "content": system_rules},
@@ -1698,7 +1729,15 @@ def process_slack_question(question: str, response_url: str):
 
             answer = chat_completion(model=MODEL_BIG, messages=messages, max_completion_tokens=700)
 
-            # Optional: add sources only when docs were used (same behavior as /ask)
+            if has_docs and not general_shiperp_q and (answer or "").lower().startswith(FALLBACK_MARKER):
+                strict_answer = answer_from_docs_strict(
+                    question=question,
+                    docs_block=docs_block,
+                    max_tokens=900,
+                )
+                if strict_answer and strict_answer.strip() != "I can't find this in the provided excerpts.":
+                    answer = strict_answer
+
             if answer.lower().startswith(FALLBACK_MARKER) or not has_docs:
                 text = answer
             else:
@@ -1710,6 +1749,7 @@ def process_slack_question(question: str, response_url: str):
     if response_url:
         post_to_slack(response_url, text)
 
+
 @app.post("/ask-from-slack")
 async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
@@ -1719,7 +1759,6 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
     if not question:
         return {"response_type": "ephemeral", "text": "Please provide a question after the command."}
 
-    # Always ack quickly, then do the heavy work async
     if response_url:
         background_tasks.add_task(process_slack_question, question, response_url)
 
@@ -1731,7 +1770,6 @@ async def ask_from_slack(request: Request, background_tasks: BackgroundTasks):
 # =========================
 @app.on_event("startup")
 async def startup_event():
-    # Default: disabled (avoids surprise memory spikes / restarts)
     if os.getenv("DISABLE_STARTUP_SYNC", "1") == "1":
         print("Startup sync disabled.")
         return
@@ -1739,7 +1777,6 @@ async def startup_event():
     async def _run():
         try:
             print("Running SharePoint download sync on startup (background)...")
-            # Optional: you can set SP_PUBLIC_SUBPATH/SP_INTERNAL_SUBPATH via env
             sp_public = os.getenv("SP_PUBLIC_SUBPATH", "public")
             sp_internal = os.getenv("SP_INTERNAL_SUBPATH", "internal")
 
@@ -1748,7 +1785,7 @@ async def startup_event():
                 "public",
                 sp_public,
                 DESTINATION_FOLDER,
-                ["pdf", "docx", "txt"],
+                ["pdf"],
                 None,
             )
             await asyncio.to_thread(
@@ -1756,7 +1793,7 @@ async def startup_event():
                 "internal",
                 sp_internal,
                 DESTINATION_FOLDER,
-                ["pdf", "docx", "txt"],
+                ["pdf"],
                 None,
             )
 
