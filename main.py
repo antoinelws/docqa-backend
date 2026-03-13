@@ -31,8 +31,6 @@ from msal import ConfidentialClientApplication
 
 from sow_estimator import router as estimator_router
 
-from fastapi import UploadFile, File
-from pathlib import Path
 import shutil
 
 
@@ -408,22 +406,6 @@ def extract_keyword_terms(question: str) -> List[str]:
             seen.add(term)
             out.append(term)
     return out[:12]
-
-# =========================
-# API for video upload
-# =========================
-
-VIDEO_RAW_DIR = Path("/data/videos/raw")
-VIDEO_RAW_DIR.mkdir(parents=True, exist_ok=True)
-
-@app.post("/upload-video")
-async def upload_video(file: UploadFile = File(...)):
-    dest = VIDEO_RAW_DIR / file.filename
-
-    with dest.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    return {"status": "uploaded", "file": file.filename}
 
 
 # =========================
@@ -969,6 +951,22 @@ app.add_middleware(
 
 app.include_router(estimator_router)
 
+
+# =========================
+# API for video upload
+# =========================
+
+VIDEO_RAW_DIR = Path("/data/videos/raw")
+VIDEO_RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.post("/upload-video")
+async def upload_video(file: UploadFile = File(...)):
+    dest = VIDEO_RAW_DIR / file.filename
+
+    with dest.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {"status": "uploaded", "file": file.filename}
 
 # =========================
 # Auth endpoints
